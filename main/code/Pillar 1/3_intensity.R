@@ -325,7 +325,7 @@ confl_intensity_global |>
         family = "Noto Sans"
     )) +
   scale_fill_manual("Conflict intensity\n(# deaths)",
-                    values = rev(unicefcol[c(1, 4, 2, 5)])) +
+                    values = intensity_palette) +
   labs(y = "Number of children (millions)") +
   scale_y_continuous(
     limits = c(0, 600000000),

@@ -15,8 +15,6 @@ library(furrr)
 
 
 # Load, clean and transform GED ====
-# ged <- readRDS(here("data", "Uppsala GEDEvent_v25_1.rds")) |>
-#   filter(best > 0)
 ged <- read_csv(here("data", "GEDEvent_v26_1.csv")) |>
   filter(best > 0)
 
@@ -65,8 +63,7 @@ ged_tls <- ged |>
 # Yugoslavia (gw = 345) -> successor states, each only through the month it
 # became independent (same convention as South Sudan above). Slovenia, Croatia,
 # North Macedonia and Bosnia were independent before our 1996 baseline, so their
-# copies only matter for pre-1996 years. No copy for Serbia: the originals are
-# already coded SRB, and a copy would count every event twice.
+# copies only matter for pre-1996 years.
 yugo_cutoffs <- tribble(
   ~code,  ~end_year, ~end_month,
   "SVN",  1991,      6,    # 25 June 1991
@@ -114,14 +111,14 @@ ged_armenia    <- ged |> filter(iso3 == "AZE") |> mutate(iso3 = "ARM", is_copy =
 pse_event <- ged$country_id == 666 & ged$adm_1 %in% c("Gaza Strip", "West Bank")
 ged$iso3[pse_event] <- "PSE"
 
+# Morocco (gw = 600) -> Western Sahara: Moroccan events also count against ESH;
+# clipping to ESH's borders keeps only those within 50 km of the territory
+ged_wsh <- ged |> filter(country_id == 600) |> mutate(iso3 = "ESH", is_copy = TRUE)
+
 ref <- ne_countries(scale = "medium", returnclass = "sf") |> filter(iso_n3 == "643")
 pts <- st_as_sf(ged, coords = c("longitude", "latitude"), crs = 4326)
 hit <- ged$country_id == 369 & lengths(st_intersects(pts, ref)) > 0
 ged$iso3[hit] <- countrycode(643, "iso3n", "iso3c")
-
-# Morocco (gw = 600) -> Western Sahara: Moroccan events also count against ESH;
-# clipping to ESH's borders keeps only those within 50 km of the territory
-ged_wsh <- ged |> filter(country_id == 600) |> mutate(iso3 = "ESH", is_copy = TRUE)
 
 # Originals first, so distinct(id) downstream keeps the original row
 ged <- bind_rows(
@@ -147,8 +144,8 @@ saveRDS(ged, file = here("data_derived", "GED_cleaned.RDS"))
 
 # Country boundaries, from Natural Earth
 countries <- ne_countries(scale = "medium", returnclass = "sf") |>
-  # NE codes these -99; fold them into the UN-recognised country (Kosovo kept
-  # separate, as in areas.xlsx).
+  # NE codes these -99; fold them into the UN-recognized country (Kosovo kept
+  # separate).
   mutate(iso_a3_eh = case_when(adm0_a3 == "KOS" ~ "KOS",
                                adm0_a3 == "SOL" ~ "SOM",   # Somaliland
                                .default = iso_a3_eh)) |>
@@ -192,7 +189,7 @@ buffers <- ged |>
 # assigned successor's polygon). Buffers stay separate, not unioned, so a pixel
 # can later accumulate every nearby event's deaths. Clip per country, binding a
 # few large sf pieces rather than thousands of small ones (much faster).
-# Parallelised: multicore (fork) when headless, multisession in the RStudio GUI.
+# Parallelized: multicore (fork) when headless, multisession in the RStudio GUI.
 if (interactive()) plan(multisession, workers = 4) else plan(multicore, workers = 4)
 
 conflict_buffers_clipped <- buffers |>
