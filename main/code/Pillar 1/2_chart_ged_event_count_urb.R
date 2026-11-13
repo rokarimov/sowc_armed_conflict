@@ -25,6 +25,7 @@ unicefcol <- c('#00AEEF', '#9ADBE8', '#0047BB', '#004C45', '#FFB500', '#FF8200',
 area <- readxl::read_xlsx(here("data", "areas.xlsx"))
 
 ged <- readRDS(here("data_derived", "GED_cleaned.RDS")) |>
+  filter(!is_copy) |>   # count each event once, not once per country it is assigned to
   filter(year %in% 1996:2025) |>   # baseline year is 1996; GED_cleaned now retains pre-1996 events
   left_join(area |> select(iso3, sdgregcode), by =  "iso3") |> 
   st_drop_geometry()

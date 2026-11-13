@@ -77,6 +77,11 @@ popAge1dt <- bind_rows(popAge1dt,
 
 # Country boundaries, from Natural Earth
 countries <- ne_countries(scale = "medium", returnclass = "sf") |>
+  # NE codes these -99; fold them into the UN-recognised country (Kosovo kept
+  # separate, as in areas.xlsx).
+  mutate(iso_a3_eh = case_when(adm0_a3 == "KOS" ~ "KOS",
+                               adm0_a3 == "SOL" ~ "SOM",   # Somaliland
+                               .default = iso_a3_eh)) |>
   filter(iso_a3_eh != "-99") |>
   rename(iso3 = iso_a3_eh) |>
   group_by(iso3) |>
@@ -115,8 +120,8 @@ ProcessYear <- function(y, buffered, wpp_shares) {
 
     v <- vect(bufs)
 
-    # Crop pop to the buffers' extent (not the country polygon) so the unclipped
-    # fallback buffers above keep their out-of-border population.
+    # Crop pop to the buffers' extent; buffers are already clipped to the
+    # country's borders in 0_ged_prep.R.
     pop_c <- crop(pop, ext(v))
     if (ncell(pop_c) == 0) return(NULL)
 
@@ -168,7 +173,7 @@ ProcessYear <- function(y, buffered, wpp_shares) {
   }
 
   out <- buffered |>
-    group_split(country, iso3) |>
+    group_split(iso3) |>
     map(CountByCountry) |>
     compact() |>
     list_rbind()
@@ -197,7 +202,8 @@ wpp_by_year <- map(years, \(y) {
       share_child = childpop / total_pop,
       .by = country_code
     ) |>
-    mutate(iso3 = countrycode(country_code, "un", "iso3c", warn = FALSE)) |>
+    mutate(iso3 = countrycode(country_code, "un", "iso3c", warn = FALSE,
+                              custom_match = c("412" = "KOS"))) |>
     filter(!is.na(iso3)) |>
     select(-country_code)
 })
@@ -263,9 +269,9 @@ AvgIntensityByCountry <- function(country_buf) {
 }
 
 
-avg_intensity <- conflict_buffers_clipped |> 
+avg_intensity <- conflict_buffers_clipped |>
   filter(year == 2025) |>
-  group_split(country, iso3) |>
+  group_split(iso3) |>
   map(AvgIntensityByCountry) |>
   compact() |>
   list_rbind() |>

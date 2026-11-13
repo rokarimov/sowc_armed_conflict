@@ -99,16 +99,19 @@ ProcessYear <- function(y, bufs_y) {
       share_child_15_17 = childpop_15_17 / total_pop,
       .by = country_code
     ) |>
-    mutate(iso3 = countrycode(country_code, "un", "iso3c", warn = FALSE)) |>
+    mutate(iso3 = countrycode(country_code, "un", "iso3c", warn = FALSE,
+                              custom_match = c("412" = "KOS"))) |>
     filter(!is.na(iso3)) |>
     select(-country_code)
 
   if (is.null(bufs_y) || nrow(bufs_y) == 0) return(NULL)
 
   # Per country: use the same clipped buffers for both the population count and the
-  # mapping geometry. For countries that split, pre-split events were duplicated onto their successors
-  # (DuplicateSplitEvents) and coded to the successor's modern ISO3, so each was
+  # mapping geometry. For countries that split, pre-split events were copied onto their
+  # successors in 0_ged_prep.R and coded to the successor's modern ISO3, so each was
   # clipped to its own modern polygon and the population splits geographically.
+  # Grouped by iso3 alone, so originals and copies for one country form a single
+  # group and overlapping population is counted once.
   ProcessCountry <- function(sub) {
     bufs <- sub[!st_is_empty(sub), ]
     if (nrow(bufs) == 0) return(NULL)
@@ -185,7 +188,7 @@ ProcessYear <- function(y, bufs_y) {
   }
 
   out <- bufs_y |>
-    group_split(country, iso3) |>
+    group_split(iso3) |>
     map(ProcessCountry) |>
     compact()
   if (length(out) == 0) return(NULL)
