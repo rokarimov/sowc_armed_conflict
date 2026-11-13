@@ -34,3 +34,7 @@
 **/*.RDS
 **/*.dta
 **/*.csv
+
+# Local tool / R GUI clutter
+.claude/
+**/.Rapp.history
