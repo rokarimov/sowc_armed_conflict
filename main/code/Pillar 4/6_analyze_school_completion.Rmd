@@ -1,0 +1,520 @@
+---
+title: "Armed Conflict and School Completion: A Cohort-Window Fixed-Effects Panel"
+author: "Rouslan Karimov"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: simplex
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 120)
+```
+
+## What this notebook does
+
+We ask whether **armed conflict lowers school completion** — at the primary, lower
+secondary and upper secondary levels. The design starts from
+[Jawad et al. (2021, *PLOS Medicine*)](https://journals.plos.org/plosmedicine/article?id=10.1371/journal.pmed.1003810)
+— a country-year panel with two-way fixed effects (country + year) and
+country-clustered standard errors, as in our mortality analysis
+(`2_analyze_mortality.Rmd`) — but the outcome forces one important adaptation.
+
+**The completion rate is measured on people who left the relevant age years ago.**
+UNESCO's completion rate — an official SDG 4.1.2 indicator — is the share of people
+aged **3 to 5 years older than the official completion age** of a school level who
+have finished that level. The three-to-five-year allowance exists because in many
+countries children start school late or repeat grades, so measuring completion right
+at the nominal completion age would miss them. The consequence for us: the people
+behind a completion rate published for year $Y$ were **in school during a window of
+past years**, and that window — not year $Y$ — is when conflict could have pushed
+them out of school.
+
+A worked example. Suppose primary school in some country runs from age 6 to age 11
+(six grades). The primary completion rate for year $Y$ is then measured on 14- to
+16-year-olds. The **oldest** of them (16) could have started primary as early as year
+$Y-10$; the **youngest** (14) left the primary age range in year $Y-3$. So the
+in-school exposure window is $Y-10$ to $Y-3$. In general, for a level lasting $d$
+years the window is
+
+$$Y-(d+4) \;\;\text{to}\;\; Y-3,$$
+
+which spans $d+2$ calendar years. Note that the school *entrance* age drops out of
+the formula: because the reference ages are pegged to the completion age, only the
+level's **duration** matters — and durations differ across countries and levels, so
+each country-year-level observation gets its own window.
+
+Within that window we measure conflict in **four ways**, echoing Jawad's
+specifications:
+
+1. `any_confl` — did conflict occur at any point in the window? (1 if any window
+   year had ≥ 25 battle-related deaths, the standard UCDP threshold for an active
+   conflict);
+2. `cum_deaths_p100k` — cumulative intensity: total battle deaths per 100,000
+   population summed over the window;
+3. `avg_deaths_p100k` — average intensity: battle deaths per 100,000 per year,
+   i.e. the mean over the window;
+4. `confl_quint` — the cumulative measure split into quintiles among
+   conflict-affected observations, with "no conflict in the window" as the
+   reference group.
+
+Two further design notes, carried over from the stunting analysis
+(`4_analyze_stunting.Rmd`):
+
+- **Exposure is built on the full annual conflict grid first** (every country-year
+  1989–2024, with zeros in peaceful years), and only then attached to the completion
+  observations — so gaps in the outcome can never corrupt the exposure.
+- **Conflict variation is concentrated in a handful of countries**, so alongside the
+  conventional country-clustered standard errors we report a **wild cluster
+  bootstrap**, which remains honest when the number of truly informative countries
+  is small.
+
+Exposure is **battle deaths per 100,000 population** from UCDP GED, pre-built in
+`1_build_master.R`. We use the master as-is.
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(readxl)
+library(fixest)
+library(fwildclusterboot)
+library(effClust)
+library(knitr)
+```
+
+## The data
+
+```{r load-master}
+master <- readRDS(here("data_derived", "pillar4_master.rds"))
+
+# Covariate set held constant across all models (same as the other Pillar 4 analyses).
+setFixest_fml(..ctrls = ~ log_gdp_pc + age_dep_ratio + pct_urban + pop_density +
+                male_schooling + temperature + rainfall + earthquake + drought)
+ctrls <- c("log_gdp_pc", "age_dep_ratio", "pct_urban", "pop_density",
+           "male_schooling", "temperature", "rainfall", "earthquake", "drought")
+```
+
+### Completion rates
+
+UNESCO models completion from all available household surveys and censuses into a
+smooth annual series per country and level, using the Adjusted Bayesian Completion
+Rates (ABCR) model of
+[Dharamshi et al. (2022, *JRSS Series C*)](https://doi.org/10.1111/rssc.12595);
+what that modelling implies for our estimates is taken up in the caveats at the end
+of this notebook. We use the headline estimate (`projected3t5`, the share completing
+within 3–5 years above the completion age — the SDG definition), both sexes
+combined. Rates are percentages.
+
+```{r load-cr}
+cr <- read_csv(here("data", "Pillar 4", "outcomes",
+                    "UNESCO Completion Rate Estimates.csv"),
+               show_col_types = FALSE) |>
+  filter(outcome == "projected3t5", sex == "total",
+         level %in% c("prim", "lsec", "usec")) |>
+  mutate(iso3, year, level, cr = value, .keep = "none")
+```
+
+### How long is each school level?
+
+Level durations come from the UNESCO school-calendar data: primary duration is the
+gap between the official entrance ages to primary and lower secondary; lower
+secondary duration is the gap between the lower- and upper-secondary entrance ages;
+upper secondary duration is reported directly. Durations are country-**and**-year
+specific (education reforms change them), so for the completion rate of year $Y$ we
+use the duration in force in year $Y-4$ — the midpoint of the years ($Y-5$ to $Y-3$)
+in which the measured cohort was finishing the level. Where a country's calendar
+series has gaps we carry the nearest reported value across them.
+
+```{r durations}
+cal <- read_excel(here("data", "UNESCO info", "school_age_calendar_info.xlsx"))
+
+durations <- cal |>
+  filter(indicatorId %in% c("299905", "999975", "999977", "999978")) |>
+  select(iso3 = geoUnit, year, indicatorId, value) |>
+  pivot_wider(names_from = indicatorId, values_from = value) |>
+  mutate(prim = `999975` - `299905`,   # entrance-age gap primary -> lower sec
+         lsec = `999977` - `999975`,   # entrance-age gap lower sec -> upper sec
+         usec = `999978`) |>           # reported directly
+  select(iso3, year, prim, lsec, usec) |>
+  pivot_longer(c(prim, lsec, usec), names_to = "level", values_to = "dur") |>
+  filter(!is.na(dur), dur >= 1) |>
+  group_by(iso3, level) |>
+  complete(year = 1990:2024) |>
+  arrange(year, .by_group = TRUE) |>
+  fill(dur, .direction = "downup") |>
+  ungroup()
+
+durations |>
+  filter(year == 2016) |>   # the calendar year feeding the 2020 completion rates
+  count(level, dur) |>
+  pivot_wider(names_from = dur, values_from = n, names_prefix = "duration ") |>
+  kable(caption = "Countries by level duration (as of 2016)")
+```
+
+### The exposure window
+
+Each completion observation gets its window $Y-(d+4)$ to $Y-3$, and we aggregate the
+annual conflict series across it. An observation is kept only if **every** window
+year is covered by the conflict data (1989–2024); together with the analysis start
+in 2000 (below), every retained observation has a complete window.
+
+```{r windows}
+crd <- cr |>
+  mutate(cal_year = year - 4) |>
+  inner_join(durations |> rename(cal_year = year),
+             by = c("iso3", "level", "cal_year")) |>
+  mutate(win_lo = year - (dur + 4), win_hi = year - 3)
+
+grid <- master |>
+  mutate(gyear = year, .keep = "unused") |>
+  select(iso3, gyear, battle_deaths, battle_deaths_p100k)
+
+expo <- crd |>
+  inner_join(grid, by = join_by(iso3, win_lo <= gyear, win_hi >= gyear)) |>
+  summarise(n_win = n(),
+            any_confl = as.integer(any(battle_deaths >= 25)),
+            cum_deaths_p100k = sum(battle_deaths_p100k),
+            avg_deaths_p100k = mean(battle_deaths_p100k),
+            .by = c(iso3, year, level, cr, dur, win_lo, win_hi)) |>
+  filter(n_win == dur + 2)
+```
+
+We then attach the covariates (measured in the outcome year $Y$), restrict the
+analysis to completion rates from **2000** on, and build the quintile variable.
+Quintile cut-points are computed within each level over the observations with any
+conflict deaths in the window; window-peaceful observations form the reference
+group ("none").
+
+```{r panel}
+covars <- master |>
+  mutate(log_gdp_pc = log(gdp_pc)) |>
+  select(iso3, year, all_of(ctrls))
+
+dta <- expo |>
+  left_join(covars, by = c("iso3", "year")) |>
+  filter(year >= 2000) |>
+  group_by(level) |>
+  mutate(confl_quint = {
+    qb <- quantile(cum_deaths_p100k[cum_deaths_p100k > 0], probs = seq(0, 1, 0.2))
+    factor(if_else(cum_deaths_p100k > 0,
+                   as.character(cut(cum_deaths_p100k, breaks = qb,
+                                    labels = paste0("Q", 1:5),
+                                    include.lowest = TRUE)),
+                   "none"),
+           levels = c("none", paste0("Q", 1:5)))
+  }) |>
+  ungroup()
+```
+
+### The estimation sample
+
+We keep rows with a completion rate, a complete window and complete covariates, and
+then drop **singleton fixed-effect groups** — countries (or years) left with a
+single observation. A lone observation is perfectly absorbed by its own fixed
+effect, contributes nothing, and breaks the wild cluster bootstrap's
+pre-processing; we drop such groups iteratively until the sample is stable. Because
+all four exposure measures are computed from the same window, they are available
+for exactly the same rows — so within a level, **all four specifications run on the
+identical sample**.
+
+```{r sample}
+MakeSample <- function(data, xvars) {
+  s <- data |>
+    filter(!is.na(cr), if_all(all_of(c(xvars, ctrls)), \(x) !is.na(x)))
+  repeat {
+    n0 <- nrow(s)
+    s <- s |>
+      add_count(iso3, name = "n_iso") |> filter(n_iso >= 2) |>
+      add_count(year, name = "n_yr")  |> filter(n_yr  >= 2) |>
+      select(-n_iso, -n_yr)
+    if (nrow(s) == n0) break
+  }
+  s |> mutate(iso3 = factor(iso3), year = factor(year))
+}
+
+exposures <- c("any_confl", "cum_deaths_p100k", "avg_deaths_p100k", "confl_quint")
+
+d_prim <- MakeSample(filter(dta, level == "prim"), exposures)
+d_lsec <- MakeSample(filter(dta, level == "lsec"), exposures)
+d_usec <- MakeSample(filter(dta, level == "usec"), exposures)
+
+tibble(
+  Level = c("Primary", "Lower secondary", "Upper secondary"),
+  Observations = c(nrow(d_prim), nrow(d_lsec), nrow(d_usec)),
+  Countries = c(n_distinct(d_prim$iso3), n_distinct(d_lsec$iso3),
+                n_distinct(d_usec$iso3)),
+  `First year` = map_dbl(list(d_prim, d_lsec, d_usec),
+                         \(d) min(as.integer(as.character(d$year)))),
+  `Last year` = map_dbl(list(d_prim, d_lsec, d_usec),
+                        \(d) max(as.integer(as.character(d$year))))
+) |>
+  kable(caption = "Estimation samples")
+```
+
+Unlike the survey-only stunting and wasting outcomes, the completion series is a
+**dense modelled panel** — nearly every country contributes every year. That makes
+the samples large, but the observations within a country are strongly serially
+dependent by construction (the model smooths across years), which is one more
+reason to lean on country-clustered inference throughout.
+
+## Descriptive picture
+
+```{r fig-scatter, fig.height=4}
+dta |>
+  filter(cum_deaths_p100k > 0) |>
+  mutate(level = factor(level, levels = c("prim", "lsec", "usec"),
+                        labels = c("Primary", "Lower secondary",
+                                   "Upper secondary"))) |>
+  ggplot(aes(cum_deaths_p100k, cr)) +
+  geom_point(alpha = 0.2, colour = "#457b9d") +
+  geom_smooth(method = "lm", colour = "#c1121f", se = TRUE) +
+  scale_x_log10(labels = scales::comma) +
+  facet_wrap(~level) +
+  labs(title = "School completion vs. cumulative conflict exposure",
+       subtitle = "Conflict-affected observations only (log x-axis); raw, before fixed effects",
+       x = "Cumulative battle deaths per 100,000 over the window (log scale)",
+       y = "Completion rate (%)") +
+  theme_minimal(base_size = 12)
+```
+
+The raw downward slopes likely reflect the fact that poorer countries have both
+more conflict and lower completion. The fixed-effects models strip out fixed
+country differences and global year shocks, and identify the effect from
+**within-country** movement in conflict exposure over time.
+
+## Models
+
+For each level we regress the completion rate on one conflict measure at a time,
+plus the covariates, with country and year fixed effects and country-clustered
+standard errors. Coefficients are in **percentage points of the completion rate**:
+for the binary measure, the difference associated with having any conflict in the
+window; for the cumulative (average) measure, the change per one additional battle
+death per 100,000 summed over the window (per year); for the quintiles, the
+difference between each intensity band and window-peaceful observations.
+
+### Primary
+
+```{r models-prim}
+m_prim_bin   <- feols(cr ~ any_confl + ..ctrls | iso3 + year,
+                      data = d_prim, cluster = ~iso3)
+m_prim_cum   <- feols(cr ~ cum_deaths_p100k + ..ctrls | iso3 + year,
+                      data = d_prim, cluster = ~iso3)
+m_prim_avg   <- feols(cr ~ avg_deaths_p100k + ..ctrls | iso3 + year,
+                      data = d_prim, cluster = ~iso3)
+m_prim_quint <- feols(cr ~ confl_quint + ..ctrls | iso3 + year,
+                      data = d_prim, cluster = ~iso3)
+
+etable(m_prim_bin, m_prim_cum, m_prim_avg, m_prim_quint,
+       keep = c("confl", "deaths"),
+       headers = c("Binary", "Cumulative", "Average", "Quintiles"))
+```
+
+### Lower secondary
+
+```{r models-lsec}
+m_lsec_bin   <- feols(cr ~ any_confl        + ..ctrls | iso3 + year,
+                      data = d_lsec, cluster = ~iso3)
+m_lsec_cum   <- feols(cr ~ cum_deaths_p100k + ..ctrls | iso3 + year,
+                      data = d_lsec, cluster = ~iso3)
+m_lsec_avg   <- feols(cr ~ avg_deaths_p100k + ..ctrls | iso3 + year,
+                      data = d_lsec, cluster = ~iso3)
+m_lsec_quint <- feols(cr ~ confl_quint      + ..ctrls | iso3 + year,
+                      data = d_lsec, cluster = ~iso3)
+
+etable(m_lsec_bin, m_lsec_cum, m_lsec_avg, m_lsec_quint,
+       keep = c("confl", "deaths"),
+       headers = c("Binary", "Cumulative", "Average", "Quintiles"))
+```
+
+### Upper secondary
+
+```{r models-usec}
+m_usec_bin   <- feols(cr ~ any_confl        + ..ctrls | iso3 + year,
+                      data = d_usec, cluster = ~iso3)
+m_usec_cum   <- feols(cr ~ cum_deaths_p100k + ..ctrls | iso3 + year,
+                      data = d_usec, cluster = ~iso3)
+m_usec_avg   <- feols(cr ~ avg_deaths_p100k + ..ctrls | iso3 + year,
+                      data = d_usec, cluster = ~iso3)
+m_usec_quint <- feols(cr ~ confl_quint      + ..ctrls | iso3 + year,
+                      data = d_usec, cluster = ~iso3)
+
+etable(m_usec_bin, m_usec_cum, m_usec_avg, m_usec_quint,
+       keep = c("confl", "deaths"),
+       headers = c("Binary", "Cumulative", "Average", "Quintiles"))
+```
+
+## Inference: how many real clusters, and a wild cluster bootstrap
+
+### Effective-cluster diagnostic
+
+The conventional standard errors treat every country as an independent source of information. But the conflict coefficient is identified only by countries whose conflict exposure during the in-school window actually *changes* from one observation to the next — where it is constant (most obviously, always zero), the country fixed effect absorbs it entirely. The amount of change is wildly unequal — a few intense conflicts dominate. We summarise this per level: the number of countries; how many are ever exposed in-sample; how many carry any within-country variation in the cumulative exposure (only these identify the coefficient); and a Herfindahl-style **effective number of clusters**, based on each country's share of the within-country variance of the exposure. The latter is a heuristic measure based on the inverse of Herfindahl-Hirschman index of concentration used in economics. It answers the question "Assuming variation were evenly distributed among equal-sized clusters, how many clusters would be needed to have the observed level of variation concentration?" When the effective number is far below the nominal one, analytic *t*-statistics can be overconfident.
+
+```{r cluster-diagnostic}
+ClusterDiag <- function(d) {
+  cl <- d |>
+    group_by(iso3) |>
+    summarise(within_ss = sum((cum_deaths_p100k - mean(cum_deaths_p100k))^2),
+              ever_exposed = any(cum_deaths_p100k > 0), .groups = "drop")
+  c(countries    = nrow(cl),
+    ever_exposed = sum(cl$ever_exposed),
+    identifying  = sum(cl$within_ss > 1e-12),   # Testing if >0; 1e-12 is an arbitrary epsilon to weed out rounding residues
+    effective    = round(sum(cl$within_ss)^2 / sum(cl$within_ss^2), 1))
+}
+
+list(Primary = d_prim, `Lower secondary` = d_lsec,
+     `Upper secondary` = d_usec) |>
+  map(ClusterDiag) |>
+  bind_rows(.id = "Level") |>
+  rename(`Countries (nominal clusters)` = countries,
+         `Ever exposed in window` = ever_exposed,
+         `With exposure variation (identifying)` = identifying,
+         `Effective number of clusters` = effective) |>
+  kable(caption = "How much independent information identifies the conflict effect?")
+```
+
+The same, but using the `effClust` package this time. 
+```{r}
+effClust(m_prim_cum, cluster = ~iso3)
+```
+
+### Wild cluster bootstrap
+
+The technique comes from
+[Cameron, Gelbach and Miller (2008, *Review of Economics and Statistics*)](https://doi.org/10.1162/rest.90.3.414).
+The idea, in plain terms: rather than trusting a textbook standard-error formula
+whose guarantees hold only when many clusters carry information, we rebuild the
+dataset thousands of times — each time keeping the fitted model but randomly
+flipping the sign of each country's *entire block* of residuals — and re-estimate
+the conflict coefficient in every rebuilt dataset under the assumption that the
+true effect is zero. If the coefficient we actually estimated would look
+unremarkable among those thousands of zero-effect re-creations, we cannot call it
+significant. Flipping residuals country-by-country — never observation by
+observation — preserves whatever correlation exists inside each country, and
+Cameron and colleagues show this yields far more accurate *p*-values than analytic
+clustered standard errors when only a few clusters dominate — precisely our
+situation. The six-value "Webb weights" we use in place of simple sign flips are a
+refinement for very small effective cluster counts, due to
+[Webb (2023, *Canadian Journal of Economics*)](https://doi.org/10.1111/caje.12661).
+
+So the parameters are: Webb 6-point weights, restricted null, 9,999 replications, clustered by country,
+with the year fixed effect held fixed in the resampling. We bootstrap the binary,
+cumulative and average coefficients, and — for the quintile specification — the
+top-intensity contrast (Q5 vs none), where any real effect should be most visible.
+Bootstrap *p*-values and confidence intervals are reported **alongside** the
+analytic ones.
+
+```{r boottest}
+BootTable <- function(models, caption) {
+  params <- c(Binary = "any_confl", Cumulative = "cum_deaths_p100k",
+              Average = "avg_deaths_p100k", Quintiles = "confl_quintQ5")
+  imap(params, \(param, spec) {
+    m <- models[[spec]]
+    set.seed(1); dqrng::dqset.seed(1)
+    bt <- boottest(m, param = param, clustid = ~iso3,
+                   fe = "year", B = 9999, type = "webb")
+    ct <- coeftable(m)[param, ]
+    tibble(
+      Specification = if (spec == "Quintiles") "Quintiles (Q5 vs none)" else spec,
+      Estimate      = round(ct[["Estimate"]], 4),
+      `Analytic p`  = round(ct[["Pr(>|t|)"]], 4),
+      `Bootstrap p` = round(bt$p_val, 4),
+      `Boot 2.5%`   = round(bt$conf_int[1], 4),
+      `Boot 97.5%`  = round(bt$conf_int[2], 4)
+    )
+  }) |>
+    list_rbind() |>
+    kable(caption = caption)
+}
+```
+
+```{r boot-prim}
+BootTable(list(Binary = m_prim_bin, Cumulative = m_prim_cum,
+               Average = m_prim_avg, Quintiles = m_prim_quint),
+          "Primary: analytic vs wild-cluster-bootstrap inference")
+```
+
+```{r boot-lsec}
+BootTable(list(Binary = m_lsec_bin, Cumulative = m_lsec_cum,
+               Average = m_lsec_avg, Quintiles = m_lsec_quint),
+          "Lower secondary: analytic vs wild-cluster-bootstrap inference")
+```
+
+```{r boot-usec}
+BootTable(list(Binary = m_usec_bin, Cumulative = m_usec_cum,
+               Average = m_usec_avg, Quintiles = m_usec_quint),
+          "Upper secondary: analytic vs wild-cluster-bootstrap inference")
+```
+
+## Interpretation and caveats
+
+- **What we find: no robust association, at any level, in any specification.** Net
+  of fixed country and year differences, none of the twelve estimates survives the
+  wild cluster bootstrap. The cautionary tale is the continuous primary-level
+  estimates: the cumulative and average intensity coefficients carry analytic
+  *p*-values near zero, yet the bootstrap sends both to *p* ≈ 0.6. At upper
+  secondary the analytically "significant" coefficients even have the *wrong*
+  (positive) sign — a further hint that these are artefacts of overconfident
+  standard errors, not signal. The binary and quintile measures are null under both
+  methods everywhere.
+- **Why the analytic and bootstrap answers disagree so sharply.** Roughly a hundred
+  countries per level are conflict-exposed in-window, but the within-country
+  variance of cumulative exposure is so concentrated that the **effective** number
+  of clusters is about **one**. With one dominant cluster, conventional clustered
+  *t*-statistics behave as if they had ~160 independent observations when they
+  effectively have one; the wild cluster bootstrap is the honest inference in that
+  situation, and its verdict — null — is the one we report.
+- **The outcome is a model, not a raw measurement.** The completion series is
+  produced by UNESCO's Adjusted Bayesian Completion Rates (ABCR) model
+  ([Dharamshi et al., 2022, *JRSS Series C*](https://doi.org/10.1111/rssc.12595)),
+  which consolidates roughly 700 census and household-survey datasets — surveys
+  arrive every 3–5 years at best — into one smooth annual series per country and
+  level. Its authors are explicit that model-based estimates "should not be
+  mistaken for the actual measure," and four features of the model matter for how
+  our estimates should be read:
+  - *Between surveys, the series is filled in by a trend model.* The underlying
+    trend is a time-series process (an ARIMA(1,1,0) with a country-specific,
+    deliberately positive long-run drift, fitted on the probit scale). The model
+    does let shocks to the *level* of completion persist — the drop after the 1994
+    Rwandan genocide, straddled by surveys, is visibly captured — but a short dip
+    that no survey directly observed is smoothed through, and the most recent
+    years of the series are projections carried by each country's drift (at
+    publication the median country's latest survey was 2017). Both features
+    *attenuate* exactly the short, sharp disruptions conflict causes, making our
+    estimates conservative for them.
+  - *Reconstructing the past assumes conflict does not remove people selectively.*
+    Because surveys are rare, the model backcasts up to 20 years of completion
+    rates from older respondents' reports, assuming completers and non-completers
+    are equally likely to have survived and stayed in the country. War violates
+    this assumption in one direction: if those pushed out of school are also more
+    likely to die or flee, the survivors interviewed later overstate their
+    cohort's completion — and the measurement is most fragile precisely in the
+    conflict-affected observations that identify our coefficient.
+  - *People invisible to every survey stay invisible.* The model can identify only
+    the *relative* bias of one survey against another; groups missed by all
+    household sampling frames — displaced families, street children, populations
+    outside households — cannot be corrected for, as the authors note. Conflict
+    swells exactly these groups.
+  - *The published uncertainty is discarded.* The estimates come with credible
+    intervals that are widest where surveys are scarce — disproportionately
+    conflict-affected countries — but our regressions weight every point estimate
+    equally.
+- **Bracket mismatch with the source model.** For internal consistency the ABCR
+  model pins each country's reference ages to its *most recent* official entry age
+  and duration, whereas our exposure windows let durations vary by year. Where a
+  reform changed a level's length, the cohort UNESCO measured and the window we
+  build for it can therefore disagree by a year or two.
+- **The window covers the level itself.** For lower and upper secondary, conflict
+  during a cohort's *earlier* schooling could also matter (a child pushed out of
+  primary school never reaches secondary); our windows do not count that earlier
+  exposure, so each level's estimate captures exposure during that level only.
+- **Durations are approximations.** Level durations are assigned from the calendar
+  in force in year $Y-4$ and gap-filled where the calendar series is incomplete;
+  members of the same measured cohort can also straddle a reform.
+- **Ecological design.** As throughout Pillar 4, this is a country-level analysis:
+  it speaks to national averages, not to the experience of individual
+  conflict-exposed children.
+```

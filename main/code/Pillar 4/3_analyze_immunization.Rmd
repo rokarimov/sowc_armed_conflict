@@ -1,0 +1,444 @@
+---
+title: "Armed Conflict and Childhood Immunization Coverage: A Fixed-Effects Panel Analysis"
+author: "Rouslan Karimov"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: simplex
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 120)
+```
+
+## What this notebook does
+
+We ask whether **armed conflict lowers childhood immunization coverage**, and if so, **how long the coverage gap lasts** after the fighting. The design follows [Jawad et al. (2021, *PLOS Medicine*)](https://journals.plos.org/plosmedicine/article?id=10.1371/journal.pmed.1003810), up to a point. Like Jawad, we use a country-year panel with two-way fixed effects (country + year) and country-clustered standard errors, regressing coverage on a conflict-exposure measure plus a fixed set of covariates. Where we depart is the functional form. Immunization coverage is a **proportion bounded at 0 and 1**, and Jawad's linear model can in principle predict impossible values outside that range while forcing the effect of conflict to be the same constant number of percentage points at every coverage level. We instead use **fractional regression** — a fractional probit estimated by quasi-maximum likelihood, following [Papke & Wooldridge (1996)](https://doi.org/10.1002/(SICI)1099-1255(199611)11:6%3C619::AID-JAE418%3E3.0.CO;2-1) — which was built precisely for a fractional response and keeps fitted values inside \([0, 1]\).
+
+The country and year fixed effects enter as dummy variables. Because a probit coefficient is not itself a percentage-point effect, we do not read the raw coefficients directly; instead we report **average marginal effects (AMEs)** on the coverage scale — the change in coverage associated with the exposure, averaged over every country-year in the estimation sample. These AMEs are the fractional-probit analogue of Jawad's linear coefficients and are read the same way (in percentage points), but they respect the bounds of the outcome.
+
+Two-way fixed-effects design:
+
+- **Country fixed effects** absorb everything time-invariant about a country (e.g., geography, history, the maturity of its cold chain and health system), so we compare each country to itself.
+- **Year fixed effects** absorb global shocks common to all countries in a year (e.g., the COVID-19 disruption to routine immunization, global supply shortages, the secular rise in coverage since the 1990s).
+- This leaves us with within-country deviation from the global trend — the variation we use to identify the conflict effect.
+
+Exposure is not lagged because a conflict disrupts routine and supplemental vaccination activities immediately. The **extended lag analysis** (0–8 years)  traces how the coverage gap evolves in the years after conflict.
+
+Unlike mortality, coverage is a "good" outcome: higher is better, so we expect conflict to enter with a **negative** sign (it should *depress* coverage). The two immunization outcomes are the WHO/UNICEF estimates of **DTP3** (third dose of the diphtheria–tetanus–pertussis vaccine) and **MCV1** (first dose of measles-containing vaccine), both expressed as the percentage of the target cohort covered.
+
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(mlmodels)
+library(marginaleffects)
+library(sjPlot)
+source(here("code/mlmodels_sjplot_bridge.R"))  # Custom bridge to allow mlmodels results to display via sjPlot
+library(texreg)
+source(here("code/mlmodels_texreg_bridge.R"))
+library(furrr)
+
+# The delta-method AMEs are slow part; the independent fits/AMEs below are run across cores
+plan(multisession, workers = min(4, parallelly::availableCores()))
+```
+
+## The data
+
+Load master dataset.
+
+```{r load}
+master <- readRDS(here("data_derived", "pillar4_master.rds"))
+
+df <- master |>
+  arrange(iso3, year) |>
+  mutate(
+    log_gdp_pc        = log(gdp_pc),
+    conflict_bin      = as.numeric(conflict_bin),
+    conflict_cat      = factor(as.character(conflict_cat),
+                               levels = c("none", "minor", "war")),
+    conflict_quintile = factor(as.character(conflict_quintile),
+                               levels = c("none", paste0("Q", 1:5))),
+    # The master reaches back to 1989 (first year of UCDP GED coverage). We
+    # analyse coverage from 1996 on, but keep the earlier rows in the panel so
+    # the lagged exposure terms can draw on 1989-1995 conflict.
+    across(c(dtp3, mcv), \(x) if_else(year >= 1996, x, NA))
+  )
+```
+
+The panel covers **`r n_distinct(df$iso3)` countries** over **`r min(df$year)`–`r max(df$year)`** (`r nrow(df)` country-years). Coverage outcomes are analysed from **1996** on; the 1989–1995 rows supply lagged conflict exposure only. Conflict exposure is specified in four alternative ways, identical to the mortality notebook:
+
+| Specification | Variable | Definition |
+|---|---|---|
+| Binary | `conflict_bin` | 1 if ≥ 25 battle-related deaths that year |
+| Categorical | `conflict_cat` | none / minor (25–999) / war (≥ 1,000) |
+| Continuous | `battle_deaths_p100k` | battle deaths per 100,000 population |
+| Quintiles | `conflict_quintile` | battle deaths per 100K people, split into quintiles |
+
+Battle deaths are summed across all three UCDP violence types (state-based, non-state, one-sided). The coverage outcomes are the WHO/UNICEF immunization estimates for `dtp3` and `mcv`, expressed as a percentage (0–100).
+
+```{r summary-table}
+df |>
+  select(dtp3, mcv, battle_deaths, battle_deaths_p100k,
+         gdp_pc, pct_urban, male_schooling) |>
+  pivot_longer(everything(), names_to = "variable") |>
+  group_by(variable) |>
+  summarise(
+    n      = sum(!is.na(value)),
+    mean   = mean(value, na.rm = TRUE),
+    sd     = sd(value, na.rm = TRUE),
+    min    = min(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    max    = max(value, na.rm = TRUE)
+  ) |>
+  mutate(across(mean:max, \(x) round(x, 1)))
+```
+
+## Descriptive analysis
+
+### Do conflict-affected countries have lower coverage?
+
+```{r fig1-coverage-trend}
+df |>
+  filter(year >= 1996) |>
+  mutate(status = if_else(conflict_bin == 1, "Conflict", "No conflict")) |>
+  group_by(year, status) |>
+  summarise(dtp3 = mean(dtp3, na.rm = TRUE),
+            mcv  = mean(mcv,  na.rm = TRUE), .groups = "drop") |>
+  pivot_longer(c(dtp3, mcv), names_to = "outcome", values_to = "coverage") |>
+  mutate(outcome = recode(outcome, dtp3 = "DTP3",
+                          mcv = "Measles (MCV1)")) |>
+  ggplot(aes(year, coverage, colour = status)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~outcome) +
+  scale_colour_manual(values = c(Conflict = "#c1121f",
+                                 `No conflict` = "#457b9d"), name = NULL) +
+  labs(title = "Mean immunization coverage by conflict status",
+       x = NULL, y = "Coverage (%)") +
+  theme_bw()
+```
+
+Coverage increases almost everywhere over the period, but conflict-affected countries sit persistently below the rest. However, conflict-prone countries tend to be poorer and to have weaker health systems in general. The fixed-effects models below help us deal with this confounding.
+
+```{r fig2-scatter}
+df |>
+  filter(battle_deaths_p100k > 0) |>
+  ggplot(aes(battle_deaths_p100k, dtp3)) +
+  geom_point(alpha = 0.2, colour = "#457b9d") +
+  geom_smooth(method = "lm", colour = "#c1121f", se = TRUE) +
+  scale_x_log10(labels = scales::comma) +
+  labs(title = "DTP3 coverage vs. conflict intensity",
+       x = "Battle deaths per 100,000 (log scale)",
+       y = "DTP3 coverage (%)") +
+  theme_minimal(base_size = 12)
+```
+
+## Models
+
+Each model regresses a coverage outcome on a contemporaneous conflict measure plus the covariates, with country and year fixed effects (entered as `factor(iso3)` and `factor(year)` dummies) and standard errors clustered by country. Conflict exposure is not lagged because a conflict disrupts routine and supplemental vaccination immediately. The [lag analysis](#how-long-does-the-effect-last-extended-lag-analysis) below traces the delayed effects.
+
+Fractional probit needs the outcome on the \([0, 1]\) scale, so we rescale the two coverage variables from percentages to proportions before fitting. `FitFP()` holds the covariate set and the two-way fixed effects fixed across every specification, so only the outcome and the exposure term change from model to model.
+
+```{r rescale}
+df <- df |> mutate(dtp3 = dtp3 / 100, mcv = mcv / 100)
+
+FitFP <- function(outcome, exposure, data = df) {
+  fml <- as.formula(paste(
+    outcome, "~", exposure,
+    "+ log_gdp_pc + age_dep_ratio + pct_urban + pop_density + male_schooling",
+    "+ temperature + rainfall + earthquake + drought",
+    "+ factor(iso3) + factor(year)"))
+  ml_probit(fml, data = data)
+}
+```
+
+```{r dtp-models}
+# DTP3
+m_bin_dtp   <- FitFP("dtp3", "conflict_bin")
+m_cat_dtp   <- FitFP("dtp3", "conflict_cat")
+m_cont_dtp  <- FitFP("dtp3", "battle_deaths_p100k")
+m_quint_dtp <- FitFP("dtp3", "conflict_quintile")
+```
+
+```{r mcv-models}
+# Measles (MCV1)
+m_bin_mcv   <- FitFP("mcv", "conflict_bin")
+m_cat_mcv   <- FitFP("mcv", "conflict_cat")
+m_cont_mcv  <- FitFP("mcv", "battle_deaths_p100k")
+m_quint_mcv <- FitFP("mcv", "conflict_quintile")
+```
+
+The tables below print the raw probit coefficients on the conflict terms (the fixed-effect dummies are omitted), with country-clustered standard errors. Sign and significance can be read directly, but the magnitudes are on the probit index scale — for percentage-point effects we turn to the average marginal effects next.
+
+### Fitted coefficients
+
+**DTP3 coverage** (only conflict predictors are shown):
+```{r tbl-dtp}
+#screenreg(list(m_bin_dtp, m_cat_dtp, m_cont_dtp, m_quint_dtp),
+#          custom.model.names = c("Binary", "Categorical", "Continuous", "Quintile"),
+#          omit.coef = "^(?!conflict_|battle_).*",
+#          vcov.type = "cluster", cl_var = "iso3")
+```
+
+```{r}
+options(mlmodels_vcov_type = "robust", mlmodels_cl_var = "iso3")
+tab_model(m_bin_dtp, m_cat_dtp, m_cont_dtp, m_quint_dtp, 
+          drop = "^(?!conflict_|battle_).*",
+          dv.labels = c("Binary", "Categorical", "Continuous", "Quintile"),
+          show.aic = TRUE,
+          show.loglik = TRUE)
+options(mlmodels_vcov_type = NULL, mlmodels_cl_var = NULL)   # reset
+```
+
+**Measles coverage** (only conflict predictors are shown):
+```{r}
+options(mlmodels_vcov_type = "robust", mlmodels_cl_var = "iso3")
+tab_model(m_bin_mcv, m_cat_mcv, m_cont_mcv, m_quint_mcv, 
+          drop = "^(?!conflict_|battle_).*",
+          dv.labels = c("Binary", "Categorical", "Continuous", "Quintile"),
+          show.aic = TRUE,
+          show.loglik = TRUE)
+options(mlmodels_vcov_type = NULL, mlmodels_cl_var = NULL)   # reset
+```
+
+
+### Average marginal effects
+
+A fractional-probit coefficient is not a percentage-point effect. To get one, we compute the **average marginal effect (AME)**: for every country-year in the sample we read off the model's predicted change in coverage as the level of conflict changes (binary/categorical/quintile: from the reference category; continuous: as a one-unit increase in battle deaths per 100,000). We then average these non-linear changes in coverage across the sample. The clustered variance-covariance matrix is passed through so the AME standard errors respect the country clustering. `AmeTerm()` picks the right `marginaleffects` verb — a contrast for factor conflict variables, a slope for the continuous one.
+
+```{r ame, results="hide", cache=TRUE}
+Vcl <- function(fit) vcov(fit, type = "cluster", cl_var = "iso3")
+
+AmeTerm <- function(fit, exposure) {
+  V <- Vcl(fit)
+  res <- if (is.factor(df[[exposure]]))
+    avg_comparisons(fit, variables = exposure, vcov = V)
+  else
+    avg_slopes(fit, variables = exposure, vcov = V)
+  as_tibble(res)
+}
+
+fits <- list(
+  DTP3 = list(Binary = m_bin_dtp, Categorical = m_cat_dtp,
+              Continuous = m_cont_dtp, Quintiles = m_quint_dtp),
+  `Measles (MCV1)` = list(Binary = m_bin_mcv, Categorical = m_cat_mcv,
+                          Continuous = m_cont_mcv, Quintiles = m_quint_mcv)
+)
+exposures <- c(Binary = "conflict_bin", Categorical = "conflict_cat",
+               Continuous = "battle_deaths_p100k", Quintiles = "conflict_quintile")
+
+ame_grid <- tidyr::expand_grid(outcome = names(fits), spec = names(exposures))
+ame <- future_map2(
+  ame_grid$outcome, ame_grid$spec,
+  \(out, spec) AmeTerm(fits[[out]][[spec]], exposures[[spec]]) |>
+    mutate(outcome = out, spec = spec),
+  .options = furrr_options(seed = TRUE,
+                           packages = c("mlmodels", "marginaleffects", "dplyr"))
+) |> list_rbind()
+```
+
+#### DTP3
+We express the AMEs in percentage points (the raw AME is on the 0–1 proportion scale, so we multiply by 100) and label the exposure contrast each row describes.
+
+```{r ame-table}
+ame_pp <- ame |>
+  mutate(
+    exposure = case_when(
+      spec == "Binary"     ~ "conflict vs none",
+      spec == "Continuous" ~ "per +1 battle death / 100k",
+      TRUE                 ~ str_replace(contrast, " - none", " vs none")
+    ),
+    across(c(estimate, conf.low, conf.high), \(x) round(100 * x, 3)),
+    p.value = round(p.value, 3)
+  )
+
+ame_pp |>
+  filter(outcome == "DTP3") |>
+  select(Specification = spec, Contrast = exposure,
+         `AME (pp)` = estimate, `2.5%` = conf.low, `97.5%` = conf.high, p = p.value)
+```
+
+Reading the DTP3 marginal effects: **any** conflict year (binary) is followed by about a **2.6-point** lower DTP3 coverage. The categorical split shows this is concentrated in the severe cases — a **war** year (≥1,000 deaths) carries a **6.8-point** deficit, while a **minor** conflict shows only a small, borderline (~1.5-point, *p* ≈ 0.06) dip. The continuous model puts a number on intensity: an extra **100 battle deaths per 100,000 people** is associated with a **≈ 4.3-point** fall in coverage *at the average*, though because the model is nonlinear that per-100 figure is not constant (see the [intensity curve](#how-coverage-falls-with-conflict-intensity) below). The quintile model confirms the gradient is monotone and back-loaded: coverage is essentially untouched in Q1–Q2, dips a significant **1.7** and **2.9 points** in Q3–Q4, and falls a full **8.5 points** in the highest-intensity Q5.
+
+
+#### Measles
+
+```{r ame-table-mcv}
+ame_pp |>
+  filter(outcome == "Measles (MCV1)") |>
+  select(Specification = spec, Contrast = exposure,
+         `AME (pp)` = estimate, `2.5%` = conf.low, `97.5%` = conf.high, p = p.value)
+```
+
+Measles coverage moves in the same direction but is a touch less exposed: any conflict year lowers MCV1 coverage by about **1.6 points**, an extra 100 battle deaths per 100,000 by about **3.5 points** at the average, a war year by **5.4 points**, and the top-intensity Q5 conflicts by **6.7 points**. As with DTP3, the binary and simple "minor" contrasts are weak or insignificant; it is intensity, not the mere presence of conflict, that drives the coverage collapse. The smaller magnitude of effects compared to DTP makes sense, since by the third dose of DTP, a child has had more opportunities to drop out than by the first dose of measles (the conflict exposure is longer).
+
+### Marginal-effect forest plot
+
+Every AME on one plot, in percentage points and grouped by specification. The continuous slope is rescaled to a **+100 battle-deaths-per-100,000** step so its magnitude is visually comparable to the categorical and quintile contrasts.
+
+```{r fig3-forest, hide=TRUE}
+forest <- ame |>
+  mutate(
+    step   = if_else(spec == "Continuous", 100, 1),      # continuous shown per +100
+    est_pp = 100 * estimate  * step,
+    lo_pp  = 100 * conf.low  * step,
+    hi_pp  = 100 * conf.high * step,
+    term_lab = case_when(
+      spec == "Binary"     ~ "Any conflict",
+      spec == "Continuous" ~ "per +100 deaths/100k",
+      TRUE                 ~ str_remove(contrast, " - none")
+    ),
+    term_lab = factor(term_lab, levels = c(
+      "Any conflict", "minor", "war", "per +100 deaths/100k", paste0("Q", 1:5))),
+    spec    = factor(spec, levels = c("Binary", "Categorical", "Continuous", "Quintiles")),
+    outcome = factor(outcome, levels = c("DTP3", "Measles (MCV1)"))
+  )
+
+ggplot(forest, aes(est_pp, term_lab, colour = outcome)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_pointrange(aes(xmin = lo_pp, xmax = hi_pp),
+                  position = position_dodge(width = 0.5)) +
+  facet_grid(spec ~ ., scales = "free_y", space = "free_y") +
+  labs(title = "Average marginal effect of conflict on coverage, 95% CI",
+       subtitle = "Percentage-point change in coverage (continuous shown per +100 deaths/100k)",
+       x = "Average marginal effect (pp)", y = NULL, colour = "Outcome") +
+  theme_bw(base_size = 12) +
+  theme(strip.text.y = element_text(angle = 0))
+```
+
+Every marginal effect that matters sits **left of zero** — conflict lowers coverage — and within each specification the two antigens track each other, with DTP3 consistently a little more exposed than measles.
+
+## How coverage falls with conflict intensity
+
+Because the probit link bends the relationship, the continuous model does not impose a single per-100-deaths toll: the marginal effect varoes with the level of violence. Following the recipe in the [`mlmodels` fractional-response vignette](https://cranhaven.r-universe.dev/articles/mlmodels/mlmodels-fractional.html), we sweep the battle-death rate over a grid and read off the model's predictions with `marginaleffects`. The one adaptation the fixed effects force on us: rather than fixing the covariates at a single mean profile (which would collapse the country and year dummies to one level), we use a **counterfactual grid** that averages each prediction over the country-years actually in the sample — the sample-averaged analogue of the vignette's chart.
+
+```{r intensity-curves, cache=TRUE}
+grid <- c(0, 5, 10, 25, 50, 75, 100, 150, 200, 300, 400, 500)
+cont_fits <- list(DTP3 = m_cont_dtp, `Measles (MCV1)` = m_cont_mcv)
+me_opts <- furrr_options(seed = TRUE, packages = c("mlmodels", "marginaleffects", "dplyr"))
+
+me_curve <- future_imap(cont_fits, \(fit, out)
+  avg_slopes(fit, variables = "battle_deaths_p100k", by = "battle_deaths_p100k",
+             newdata = datagrid(battle_deaths_p100k = grid, grid_type = "counterfactual"),
+             vcov = Vcl(fit)) |>
+    as_tibble() |> mutate(outcome = out),
+  .options = me_opts
+) |> list_rbind()
+```
+
+
+Plot the marginal effect — how much another 100 battle deaths costs, at each starting level:
+
+```{r fig-me, fig.height=4}
+ggplot(me_curve, aes(battle_deaths_p100k, 100 * 100 * estimate)) +
+  geom_ribbon(aes(ymin = 100 * 100 * conf.low, ymax = 100 * 100 * conf.high),
+              alpha = 0.15, fill = "#1d3557") +
+  geom_line(colour = "#1d3557", linewidth = 0.9) +
+  geom_point(colour = "#1d3557", size = 1.4) +
+  facet_wrap(~outcome) +
+  labs(title = "Marginal effect of conflict intensity on coverage",
+       subtitle = "Coverage change per +100 battle deaths / 100k, evaluated at each level, 95% CI",
+       x = "Battle deaths per 100,000", y = "Effect on coverage (pp per +100)") +
+  theme_bw(base_size = 12)
+```
+
+At the low-violence end where most country-years sit, the marginal cost of the first 100 battle deaths per 100,000 is about **4.3 points** of lost DTP3 coverage. As intensity climbs the curve steepens: the marginal cost of another 100 deaths grows to **5.3 points** at 100, **6.3** at 200, and **8.2** by 500. So the "≈ 4.3 points per 100" headline is an *average* over a curve whose bite grows with the fighting. This is the opposite of diminishing marginal damage: over the observed range each increment of violence removes *more* coverage than the last.
+
+## How long does the effect last? Extended lag analysis
+
+Following Jawad's central contribution, we ask how long coverage stays depressed after conflict. We fit, for each lag $k = 0…8$, a separate fractional-probit model with conflict entered at lag $k$, and report the **AME at that lag**. `mlmodels` has no `sw()`-style stepwise operator, so we loop: at each lag we build the within-country lagged exposure with `dplyr::lag()` and refit. We do this for the **binary** and **continuous** exposures, for DTP3 and measles.
+
+```{r lag-profile, cache=TRUE}
+lag_specs <- c(Binary = "conflict_bin", Continuous = "battle_deaths_p100k")
+outcomes  <- c(DTP3 = "dtp3", `Measles (MCV1)` = "mcv")
+
+# One task per (spec, outcome, lag) = 36 independent fits+AMEs, run across cores.
+lag_grid <- tidyr::expand_grid(spec = names(lag_specs),
+                               oc = names(outcomes), k = 0:8)
+
+lag_profile <- future_pmap(lag_grid, \(spec, oc, k) {
+  v <- lag_specs[[spec]]
+  d <- df |> group_by(iso3) |>
+    mutate(x_lag = dplyr::lag(.data[[v]], k)) |> ungroup()
+  fit <- FitFP(outcomes[[oc]], "x_lag", data = d)
+  avg_slopes(fit, variables = "x_lag",
+             vcov = vcov(fit, type = "cluster", cl_var = "iso3")) |>
+    as_tibble() |>
+    mutate(lag = k, estimate = estimate, conf.low = conf.low, conf.high = conf.high,
+           p.value = p.value, spec = spec, outcome = oc, .keep = "none")
+}, .options = furrr_options(seed = TRUE,
+                            packages = c("mlmodels", "marginaleffects", "dplyr"))
+) |> list_rbind()
+```
+
+```{r fig4-lag-profile, fig.height=6}
+lag_profile |>
+  mutate(
+    mult    = if_else(spec == "Continuous", 1e4, 100),  # continuous per +100 deaths/100k
+    est     = mult * estimate,
+    lo      = mult * conf.low,
+    hi      = mult * conf.high,
+    outcome = factor(outcome, levels = names(outcomes))
+  ) |>
+  ggplot(aes(lag, est)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey50") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, fill = "#c1121f") +
+  geom_line(colour = "#c1121f", linewidth = 0.8) +
+  geom_point(colour = "#c1121f") +
+  facet_wrap(vars(outcome, spec), scales = "free_y", nrow = 2) +
+  scale_x_continuous(breaks = 0:8) +
+  labs(title = "Effect of conflict on immunization coverage by years since exposure",
+       subtitle = "Average marginal effect at lag k, 95% CI (continuous per +100 deaths/100k)",
+       x = "Years since conflict (lag)", y = "Effect on coverage (pp)") +
+  theme_bw(base_size = 12)
+```
+
+The continuous (intensity) specification tells a clean and consistent story for both antigens: coverage is significantly depressed from the conflict year through **lag 4**. The effect deepens over the first two years, bottoms out around lag 2, then climbs back toward zero and loses significance from **lag 5** onward. This is the same **~4-year "shadow"** we found for child mortality: conflict knocks routine immunization down for several years even after the fighting stops, consistent with damage to the cold chain, health workforce, outreach and demand that outlasts the violence itself. The binary specification is noisier — for measles a couple of the middle lags brush insignificance — so we read the persistence story off the intensity-based results.
+
+## Sensitivity: adding democracy and ethnic fractionalisation
+
+Jawad excludes the electoral-democracy and ethnic-fractionalisation indices from the main models because of high missingness (and, for HIEF, coverage ending in 2013). Adding them back shrinks the sample but lets us check that the conflict effect is not an artefact of omitting them. `FitFP()` takes the extra terms in its `exposure` slot, so the covariates and fixed effects stay identical to the main model.
+
+```{r sensitivity}
+m_sens_dtp3 <- FitFP("dtp3", "battle_deaths_p100k + dem_idx + ethnic_frac")
+
+main_row <- ame |>
+  filter(outcome == "DTP3", spec == "Continuous") |>
+  mutate(Model = "Main", estimate = estimate, conf.low = conf.low,
+         conf.high = conf.high, p.value = p.value, n = nobs(m_cont_dtp),
+         .keep = "none")
+
+sens_row <- avg_slopes(m_sens_dtp3, variables = "battle_deaths_p100k",
+                       vcov = Vcl(m_sens_dtp3)) |>
+  as_tibble() |>
+  mutate(Model = "+ democracy & ethnic frac.", estimate = estimate,
+         conf.low = conf.low, conf.high = conf.high, p.value = p.value,
+         n = nobs(m_sens_dtp3), .keep = "none")
+
+bind_rows(main_row, sens_row) |>
+  mutate(Model = Model,
+         `AME per +100 deaths (pp)` = round(1e4 * estimate, 2),
+         `2.5%` = round(1e4 * conf.low, 2),
+         `97.5%` = round(1e4 * conf.high, 2),
+         p = signif(p.value, 3), n = n, .keep = "none")
+```
+
+On the reduced, HIEF-limited sample (roughly half the country-years) the battle-deaths marginal effect stays negative and highly significant — and is, if anything, a little **larger** than in the main model. The conflict result is not being propped up by leaving democracy and ethnic fractionalisation out.
+
+## Interpretation and caveats
+
+- **Direction and intensity.** Net of fixed country and year differences, conflict is strongly associated with **lower** childhood immunization coverage, and the deficit grows with **intensity** (war > minor; Q5 > lower quintiles) rather than mere presence. DTP3 shows larger declines than measles, which is consistent with the target group's longer exposure to conflict.
+- **Persistence.** The coverage deficit **persists for about four years** after conflict before dissipating.
+- **This is an ecological, country-level design.** It identifies national associations, not individual causal effects.
+- **Bounded outcome, non-constant effect.** Because coverage is a proportion, we model it with a fractional probit rather than OLS: fitted values stay inside \([0, 1]\), and — unlike the linear model — the marginal effect is allowed to vary with the coverage level. It does: over the observed range the marginal damage of extra violence *grows* rather than diminishes, as coverage slides down the steep middle of the probit curve. The AMEs should therefore be read as **sample-averaged percentage-point shifts**; the true effect at any given country-year depends on where it sits on that curve (see the [intensity curves](#how-coverage-falls-with-conflict-intensity)).
+- **Quasi-likelihood inference.** The fractional probit is estimated by quasi-MLE, under which the Bernoulli information-matrix identity does not hold, so model-based (OIM/OPG) standard errors are invalid. We use sandwich standard errors clustered by country throughout — for the fitted coefficients, the AMEs, and the predicted-coverage curves alike.
+- **Incidental parameters.** Country fixed effects in a nonlinear model can bias estimates in short panels (the incidental-parameters problem). Our panel is ~29 years deep per country, which keeps that bias modest, but it is not zero.
+- **Data caveats carried from the master build:** `pop_density` is mean persons/km² rather than Jawad's ">1,000/km² share"; `ethnic_frac` ends in 2013.
+
+```{r cleanup, include=FALSE}
+plan(sequential)  # shut down the worker processes
+```

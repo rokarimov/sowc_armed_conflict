@@ -1,0 +1,225 @@
+---
+title: "Armed Conflict and Child Wasting: A Short-Lag Fixed-Effects Panel"
+author: "Rouslan Karimov"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: simplex
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 120)
+```
+
+## What this notebook does
+
+We ask whether **armed conflict raises child wasting** (the prevalence of low
+weight-for-height among under-fives). Wasting is the mirror image of stunting: it is
+**acute** malnutrition — a *flow*, not a stock. Weight-for-height drops within weeks of
+a shock and recovers within months. So, unlike stunting (see `4_analyze_stunting.Rmd`,
+which uses a long cumulative-exposure window), wasting calls for a **short lag**, close
+to the original design of
+[Jawad et al. (2021, *PLOS Medicine*)](https://journals.plos.org/plosmedicine/article?id=10.1371/journal.pmed.1003810).
+
+The rest of the design matches our other Pillar 4 panels: country-year two-way fixed
+effects, country-clustered standard errors, and — because conflict variation is
+concentrated in few countries and the survey-only outcome is sparse — a **wild cluster
+bootstrap** reported alongside the analytic standard errors. Exposure is **battle
+deaths per 100,000 population** from UCDP GED, taken from the master panel built in
+`1_build_master.R`. Lags are built on the full annual conflict grid, then
+subset to survey-year rows, so the sparsity of the outcome never corrupts the lag.
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(fixest)
+library(broom)
+library(fwildclusterboot)
+```
+
+## The data
+
+```{r load}
+master <- readRDS(here("data_derived", "pillar4_master.rds"))
+
+setFixest_fml(..ctrls = ~ log_gdp_pc + age_dep_ratio + pct_urban + pop_density +
+                male_schooling + temperature + rainfall + earthquake + drought)
+ctrls <- c("log_gdp_pc", "age_dep_ratio", "pct_urban", "pop_density",
+           "male_schooling", "temperature", "rainfall", "earthquake", "drought")
+
+# One-year-lagged exposure, built on the full annual grid then carried to survey rows.
+panel <- master |>
+  arrange(iso3, year) |>
+  mutate(lag1_bd_p100k = dplyr::lag(battle_deaths_p100k),
+         log_gdp_pc    = log(gdp_pc),
+         .by = iso3)
+```
+
+### The estimation sample
+
+Survey-year rows with a defined one-year lag and complete covariates, dropping
+singleton fixed-effect groups (a lone observation is perfectly absorbed by its own
+fixed effect, contributes nothing to the within estimator, and breaks the bootstrap's
+pre-processing).
+
+```{r sample}
+MakeSample <- function(data, yvar, xvars) {
+  s <- data |>
+    filter(year >= 1996,   # outcomes are analysed from 1996 on
+           !is.na(.data[[yvar]]),
+           if_all(all_of(c(xvars, ctrls)), \(x) !is.na(x)))
+  repeat {
+    n0 <- nrow(s)
+    s <- s |>
+      add_count(iso3, name = "n_iso") |> filter(n_iso >= 2) |>
+      add_count(year, name = "n_yr")  |> filter(n_yr  >= 2) |>
+      select(-n_iso, -n_yr)
+    if (nrow(s) == n0) break
+  }
+  s |> mutate(iso3 = factor(iso3), year = factor(year))
+}
+
+df <- MakeSample(panel, "wast", "lag1_bd_p100k")
+```
+
+The estimation sample is **`r nrow(df)` survey-country-years** across
+**`r n_distinct(df$iso3)` countries** and
+**`r min(as.integer(as.character(df$year)))`–`r max(as.integer(as.character(df$year)))`**.
+Wasting prevalence is in percentage points; `lag1_bd_p100k` is battle deaths per
+100,000 in the year before the survey.
+
+```{r summary-table}
+df |>
+  mutate(wast, lag1_bd_p100k, log_gdp_pc, pct_urban, male_schooling,
+         .keep = "none") |>
+  pivot_longer(everything(), names_to = "variable") |>
+  group_by(variable) |>
+  summarise(n = sum(!is.na(value)), mean = mean(value), sd = sd(value),
+            min = min(value), median = median(value), max = max(value)) |>
+  mutate(across(mean:max, \(x) round(x, 2)))
+```
+
+## Primary model
+
+Wasting on one-year-lagged conflict intensity plus covariates, with country and year
+fixed effects and country-clustered standard errors.
+
+```{r primary}
+m_wast <- feols(wast ~ lag1_bd_p100k + ..ctrls | iso3 + year,
+                data = df, cluster = ~iso3)
+etable(m_wast, keep = "lag1_bd_p100k", headers = "Wasting (pp)")
+```
+
+## Inference: how many real clusters, and a wild cluster bootstrap
+
+```{r cluster-diagnostic}
+cl <- df |>
+  group_by(iso3) |>
+  summarise(within_ss = sum((lag1_bd_p100k - mean(lag1_bd_p100k))^2),
+            ever_exposed = any(lag1_bd_p100k > 0), .groups = "drop")
+
+tibble(
+  quantity = c("Countries (nominal clusters)",
+               "Ever conflict-exposed in sample",
+               "With within-country exposure variation (identifying)",
+               "Effective number of clusters (Herfindahl)"),
+  value = c(nrow(cl),
+            sum(cl$ever_exposed),
+            sum(cl$within_ss > 1e-12),
+            round(sum(cl$within_ss)^2 / sum(cl$within_ss^2), 1))
+)
+```
+
+```{r boottest}
+set.seed(1); dqrng::dqset.seed(1)
+bt_wast <- boottest(m_wast, param = "lag1_bd_p100k", clustid = ~iso3,
+                    fe = "year", B = 9999, type = "webb")
+
+analytic <- coeftable(m_wast)["lag1_bd_p100k", ]
+tibble(
+  method   = c("Analytic (country-clustered)", "Wild cluster bootstrap (Webb)"),
+  estimate = round(c(analytic["Estimate"], bt_wast$point_estimate), 4),
+  p_value  = round(c(analytic["Pr(>|t|)"], bt_wast$p_val), 4),
+  ci_low   = round(c(confint(m_wast)["lag1_bd_p100k", 1], bt_wast$conf_int[1]), 4),
+  ci_high  = round(c(confint(m_wast)["lag1_bd_p100k", 2], bt_wast$conf_int[2]), 4)
+)
+```
+
+## How long does the effect last? Lag profile (0–8 years)
+
+To confirm wasting behaves as an *acute* outcome, we trace the coefficient on conflict
+entered at each lag $k = 0…8$ in its own model (the `sw()` stepwise operator, as in the
+mortality analysis). For a flow outcome we expect an effect concentrated at the short
+lags that fades quickly — the opposite of stunting's slow, persistent stock response.
+Lags are computed on the full annual panel via `fixest::l()`; each model uses its own
+available survey sample.
+
+```{r lag-profile, fig.height=4.5}
+lagpanel <- master |>
+  arrange(iso3, year) |>
+  mutate(log_gdp_pc = log(gdp_pc),
+         # analyse surveys from 1996 on; earlier rows only supply lagged exposure
+         wast = if_else(year >= 1996, wast, NA))
+
+lags_str <- paste0("l(battle_deaths_p100k, ", 0:8, ")", collapse = ", ")
+fml <- as.formula(sprintf("wast ~ sw(%s) + %s | iso3 + year",
+                          lags_str, paste(ctrls, collapse = " + ")))
+
+fit <- feols(fml, data = lagpanel, panel.id = ~iso3 + year, cluster = ~iso3)
+
+lag_profile <- imap(fit, \(mod, i) {
+  tidy(mod, conf.int = TRUE) |>
+    filter(str_detect(term, "battle_deaths_p100k")) |>
+    mutate(lag = as.integer(str_extract(term, "(?<=, )[0-9]+")))
+}) |> list_rbind()
+
+ggplot(lag_profile, aes(lag, estimate)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey50") +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, fill = "#c1121f") +
+  geom_line(colour = "#c1121f", linewidth = 0.8) +
+  geom_point(colour = "#c1121f") +
+  scale_x_continuous(breaks = 0:8) +
+  labs(title = "Effect of conflict on wasting by years since exposure",
+       subtitle = "Coefficient on battle deaths per 100k lagged k years, 95% CI (analytic)",
+       x = "Years since conflict (lag)", y = "Effect on wasting (pp)") +
+  theme_bw(base_size = 12)
+```
+
+## Robustness: logit-transformed prevalence
+
+```{r robust-logit}
+df_logit <- df |> mutate(wast_logit = qlogis(wast / 100))
+m_logit  <- feols(wast_logit ~ lag1_bd_p100k + ..ctrls | iso3 + year,
+                  data = df_logit, cluster = ~iso3)
+set.seed(1); dqrng::dqset.seed(1)
+bt_logit <- boottest(m_logit, param = "lag1_bd_p100k", clustid = ~iso3,
+                     fe = "year", B = 9999, type = "webb")
+etable(m_logit, keep = "lag1_bd_p100k", headers = "Wasting (logit)")
+cat(sprintf("Wild cluster bootstrap: p = %.4f, 95%% CI = [%.4f, %.4f]\n",
+            bt_logit$p_val, bt_logit$conf_int[1], bt_logit$conf_int[2]))
+```
+
+## Interpretation and caveats
+
+- **What we find.** Net of fixed country and year differences, the one-year-lagged
+  conflict coefficient on wasting is small and **not statistically distinguishable from
+  zero**, and the wild cluster bootstrap widens the interval further. The logit check
+  agrees. At the country-average, survey-only level we do not find robust evidence that
+  conflict raises wasting.
+- **The lag profile behaves as expected for a flow.** Whatever short-lag signal exists
+  does not build or persist across years — consistent with wasting being acute and
+  recoverable, and in deliberate contrast to the slow, persistent shape one would look
+  for in a stunting (stock) response.
+- **Ecological design.** This identifies national associations, not individual causal
+  effects; micro-level studies routinely find sharp wasting spikes in acute crises that
+  a country-average annual panel can miss.
+- **Few clusters.** The effective number of identifying clusters is well below the
+  nominal country count, so power is limited; the bootstrap makes that explicit.
+- **Data caveats carried from the master build:** exposure begins in 1989 (the first
+  year of UCDP GED coverage); competing survey values per country-year were resolved
+  on methodology upstream in `1_build_master.R`.
+```

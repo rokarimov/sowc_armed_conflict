@@ -1,0 +1,36 @@
+# Secrets
+**/.Renviron
+
+# R / RStudio / OS clutter
+**/.Rhistory
+**/.Rproj.user/
+**/.DS_Store
+**/.ipynb_checkpoints/
+**/*_cache/
+**/*_files/
+
+# Data, derived data, readings and outputs (incl. confidential datasets)
+**/data/
+**/data_derived/
+**/readings/
+**/outputs/
+**/results/
+**/docs/
+**/literature_reviews/
+
+# Binary / large artefacts
+**/*.html
+**/*.docx
+**/*.pptx
+**/*.xlsx
+**/*.xmind
+**/*.pdf
+**/*.png
+**/*.eps
+**/*.tif
+**/*.RData
+**/*.Rdata
+**/*.rds
+**/*.RDS
+**/*.dta
+**/*.csv

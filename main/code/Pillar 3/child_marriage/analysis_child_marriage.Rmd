@@ -1,0 +1,397 @@
+---
+title: 'Conflict Exposure and Child Marriage: A Walkthrough'
+author: "Rouslan Karimov"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: simplex
+  pdf_document: 
+    toc: true
+    latex_engine: lualatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE, warning = FALSE, message = FALSE)
+```
+
+## What this notebook does
+
+We want to know whether women whose **childhoods overlapped armed conflict** were
+more likely to have been **married before 18** than women whose childhoods did
+not.
+
+We test this on two surveys to illustrate two different conventions:
+
+- **Mali 2023-24 DHS**
+- **Nigeria 2021 MICS**
+
+The same logic applies in both cases:
+
+1. Geocode each survey cluster and overlay it on conflict-buffer polygons
+   (one per country-year, built from PRIO/UCDP GED events upstream).
+2. For each woman, identify the calendar years she was 0–17 and check whether
+   any of those [cluster, year] pairs intersect a conflict buffer.
+3. Build the child-marriage flag from age at first cohabitation.
+4. Estimate prevalence with the survey-design-aware tools in `survey::`,
+   compare in-zone vs out-of-zone, and run a t-test.
+
+This document mirrors `analysis_child_marriage.R` step-by-step.
+
+## Setup
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(sf)
+library(haven)
+library(countrycode)
+library(survey)
+```
+
+The conflict-buffer layer is precomputed once for the whole project. It's a
+single `sf` data frame with one polygon per (`iso3`, `year`).
+
+```{r buffers}
+buffers <- readRDS(here("data_derived", "ged_country_year_buffers.rds"))
+```
+
+# Mali 2023-24 DHS
+
+## Loading the survey
+
+DHS distributes each survey as several recode files. We need two:
+
+- The **GE** (geographic) file — one row per cluster, with GPS coordinates.
+- The **IR** (individual recode) file — one row per woman, with everything
+  about her (age, marital history, weights, cluster ID, etc.).
+
+```{r mli-load}
+ccode <- "MLI"
+
+clusters <- st_read(
+  here("data", "Mali_2023-24_DHS",
+       "MLGE8AFL - Geographic Data", "MLGE8AFL.shp"),
+  quiet = TRUE
+) |>
+  mutate(iso3 = countrycode(DHSCC, origin = "iso2c", destination = "iso3c")) |>
+  filter(SOURCE != "MIS", LATNUM != 0, LONGNUM != 0) |>
+  st_transform(crs = 4326)
+
+ir <- read_dta(here("data", "Mali_2023-24_DHS",
+                    "MLIR8ADT - Individual", "MLIR8AFL.dta"))
+```
+
+Two filtering details on the cluster layer:
+
+- `SOURCE != "MIS"` drops missing-coordinate clusters. DHS uses `"MIS"` to
+  mark clusters whose GPS could not be recovered.
+- `LATNUM != 0, LONGNUM != 0` drops the placeholder `(0,0)` coordinates that
+  DHS sometimes uses for displaced or sensitive clusters.
+
+We standardise the CRS to **WGS84 (EPSG:4326)** because that's what the
+buffer polygons use. Spatial intersections only make sense if both layers are
+in the same coordinate system.
+
+## Childhood conflict exposure
+
+For each woman:
+
+- DHS records her birth year directly in `v010`, so her childhood window is
+  `v010` to `v010 + 17`.
+- We filter data to the analysis cohort (women 18–49) using the current-age variable `v012`.
+  to the analysis cohort .
+- Her cluster's location is fixed (we assume no migration history).
+- A buffer polygon exists for each (country, year) where conflict was active.
+
+So the question reduces to: *did any year in this woman's childhood window
+correspond to a conflict buffer at her cluster's location?*
+
+We precompute the cluster-by-buffer intersection matrix once — every cell
+tells us whether cluster *i* falls inside buffer *j*. This saves computing time:
+in repeated function calls later, it becomes a lookup, not a re-intersection each time.
+
+```{r mli-exposure}
+buffers_ccode <- buffers |> filter(iso3 == ccode)
+hits          <- st_intersects(clusters, buffers_ccode, sparse = FALSE)
+buffer_years  <- buffers_ccode$year
+
+calcConflExpDHS <- function (v001, v010, v012) {
+  if (is.na(v012) || v012 < 18 || v012 >= 50) return(NA_integer_)
+  if (is.na(v010)) return(NA_integer_)
+  clust_row <- match(v001, clusters$DHSCLUST)
+  if (is.na(clust_row)) return(NA_integer_)
+  sum(hits[clust_row, ] & buffer_years %in% v010:(v010 + 17))
+}
+
+ir$conflict_exposure <- purrr::pmap_int(
+  list(v001 = as.numeric(ir$v001),
+       v010 = as.numeric(ir$v010),
+       v012 = as.numeric(ir$v012)),
+  calcConflExpDHS
+)
+ir$exposed <- ir$conflict_exposure > 0
+```
+
+`conflict_exposure` is a *count* of childhood-years overlapping conflict — a
+woman who grew up inside a five-year war has `5`, a woman who grew up nowhere
+near conflict has `0`. The binary `exposed` flag is what we actually use; the
+count is kept around for **potential further analyses by exposure intensity**.
+
+## Building the child-marriage flag
+
+The DHS variable `v511` is **age at first cohabitation** (effectively, the
+age at which a woman first lived with a partner). It's `NA` for women who
+have never married or cohabited.
+
+We follow the official DHS-Indicators-R code (<https://github.com/DHSProgram/DHS-Indicators-R/blob/main/Chap04_MS/MS_MAR.R>):
+
+```{r mli-cm-flag}
+ir <- ir |>
+  mutate(
+    chmarry = case_when(
+      v511 >= 0 & v511 < 18 ~ 1,
+      .default              = 0
+    )
+  )
+```
+
+Two subtleties worth understanding:
+
+- **Never-married women get `chmarry = 0`** via the `.default` branch. They
+  never married, so they certainly didn't marry before 18.
+- **The `v511 >= 0` guard** excludes any negative system-missing codes. In
+  practice DHS represents "never married" with `NA`, but the guard is cheap
+  insurance.
+
+
+## The survey design
+
+Survey-design-aware estimators need to know about three things:
+
+- **Primary sampling units** (clusters) — `v021`. SEs need to account for
+  within-cluster correlation; ignoring this inflates apparent precision.
+- **Strata** — `v022`. DHS samples are stratified, typically by region × urban/rural.
+- **Sampling weights** — `v005`, divided by 1,000,000. DHS stores weights
+  scaled up by 10⁶ to keep them as integers in fixed-width formats.
+
+```{r mli-design}
+ir$wgt  <- ir$v005 / 1000000
+ir <- ir |>
+  mutate(awfactt = awfactt / 100)
+
+ir_design <- svydesign(
+  id      = ~v021,
+  strata  = ~v022,
+  weights = ~wgt,
+  data    = ir,
+  nest    = TRUE
+)
+```
+
+`nest = TRUE` tells `survey` that PSUs are nested within strata (DHS standard).
+
+We also rescale `awfactt`. DHS recodes store the all-women factor as
+*(factor × 100)* so that it fits as an integer; we put it back on the natural
+scale where 1 = no correction.
+
+### The AWFACTT correction (what, why, when)
+
+**Some DHS surveys interview only ever-married women** (called the
+"ever-married sample"). For these surveys, the women you observe are *not*
+representative of all women — never-married women aren't in the data.
+A naive `svymean(~chmarry)` on this sample gives you the share of
+*ever-married* women who married before 18, which is mechanically much higher
+than the share of *all women* who married before 18.
+
+DHS publishes its child-marriage indicator on an **all-women denominator**.
+To make our estimate match, the denominator has to be expanded to represent
+the never-married women who weren't sampled. That's what [AWFACTT does](https://www.dhsprogram.com/data/Guide-to-DHS-Statistics/index.htm#t=Analyzing_DHS_Data.htm%23All_Women_Factorsbc-5&rhtocid=_4_4_4):
+
+$$\text{AWFACTT}_i = \frac{\text{all women in } i\text{'s cluster}}{\text{ever-married women in } i\text{'s cluster}}$$
+
+For ever-married surveys, AWFACTT is typically > 1 — each interviewed woman
+"stands in" for herself and the never-married women in her household. For
+all-women surveys (Mali 2023 included), AWFACTT = 1 everywhere and applying
+the correction does nothing. Both cases handle through one formula:
+
+$$\widehat{\text{CM}}_{\text{all women}} = \frac{\sum_i w_i \cdot \text{cm}_i}{\sum_i w_i \cdot \text{AWFACTT}_i}$$
+
+Crucially, AWFACTT goes in **the denominator only** — it expands the
+population we're dividing into, but the numerator (women who actually had
+CM) doesn't change because never-married women, by definition, contribute
+zero to it. If you naively use `weights = ~I(perweight * awfactt)` in
+`svydesign`, AWFACTT lands in *both* numerator and denominator and cancels
+out — you'd get the (wrong) ever-married-only rate back.
+
+The right way is `svyratio()`, which is built for exactly this kind of
+ratio-of-totals estimator.
+
+## Two cohorts: 20-24 and 18-49
+
+Different questions need different denominators:
+
+- **20–24**: this is the age window in DHS's published child-marriage
+  indicator (`MA_MBAY_W_B18`). We use it as a **sanity check** — our number
+  for women 20–24 should match the published number for women 20–24, exactly.
+   It's how we know our pipeline is right.
+- **18–49**: this is the **comparison cohort** for the in-zone vs out-zone
+  test. A wider age window means more women, more clusters per arm, more
+  statistical power. It also lets us pick up effects of older conflicts whose
+  victims have aged out of the 20–24 window.
+
+```{r mli-cohorts}
+design_20_24 <- subset(ir_design, v012 >= 20 & v012 <= 24)
+design_18_49 <- subset(ir_design, v012 >= 18 & v012 <= 49)
+```
+
+## Running the analysis
+
+Three things, each on the appropriate cohort:
+
+```{r mli-analysis}
+# Sanity check: matches DHS published indicator MA_MBAY_W_B18 (women 20-24).
+svyratio(~chmarry, ~awfactt, design = design_20_24, na.rm = TRUE)
+
+# Conflict comparison: in-zone vs out-zone prevalence among women 18-49.
+svyby(~chmarry, by = ~exposed, design = design_18_49,
+      FUN = svyratio, denominator = ~awfactt, na.rm = TRUE)
+
+# The hypothesis test.
+svyttest(chmarry ~ exposed, design = design_18_49)
+```
+
+The t-test is design-aware — it accounts for clustering and stratification,
+which is necessary for honest p-values. (A naive `t.test()` on the same data
+would understate SEs by a factor related to the design effect.)
+
+# Nigeria 2021 MICS
+
+The structure is essentially the same. We highlight only what's different.
+
+## Loading the survey
+
+MICS uses SPSS files (`.sav`) and slightly different naming. Cluster IDs are
+stored as `HH1` in the GPS shapefile and `WM1` in the women's file.
+
+```{r nga-load}
+ccode <- "NGA"
+
+clusters <- st_read(
+  here("data", "Nigeria_2021_MICS",
+       "Geographic Data", "NigeriaMICS2021GPS.shp"),
+  quiet = TRUE
+) |> st_transform(crs = 4326)
+
+wm <- read_sav(here("data", "Nigeria_2021_MICS",
+                    "SPSS Datasets", "wm.sav"))
+```
+
+## Childhood conflict exposure
+
+Same algorithm, different column names. In MICS, birth year is `WB3Y`,
+current age is `WB4`, and the cluster ID is `WM1`.
+
+```{r nga-exposure}
+buffers_ccode <- buffers |> filter(iso3 == ccode)
+hits          <- st_intersects(clusters, buffers_ccode, sparse = FALSE)
+buffer_years  <- buffers_ccode$year
+
+calcConflExpMICS <- function (WM1, WB3Y, WB4) {
+  if (is.na(WB4) || WB4 < 18 || WB4 >= 50) return(NA_integer_)
+  if (is.na(WB3Y)) return(NA_integer_)
+  clust_row <- match(WM1, clusters$HH1)
+  if (is.na(clust_row)) return(NA_integer_)
+  sum(hits[clust_row, ] & buffer_years %in% WB3Y:(WB3Y + 17))
+}
+
+wm$conflict_exposure <- purrr::pmap_int(
+  list(WM1  = as.numeric(wm$WM1),
+       WB3Y = as.numeric(wm$WB3Y),
+       WB4  = as.numeric(wm$WB4)),
+  calcConflExpMICS
+)
+wm$exposed <- wm$conflict_exposure > 0
+```
+
+## Child marriage flag
+
+MICS uses `WAGEM` (age at first marriage) — directly analogous to DHS `v511`.
+Same logic, same defaults.
+
+```{r nga-cm-flag}
+wm <- wm |>
+  mutate(
+    chmarry = case_when(
+      WAGEM >= 0 & WAGEM < 18 ~ 1,
+      .default                = 0
+    )
+  )
+```
+
+## Survey design (no AWFACTT)
+
+Unlike DHS, MICS generally interviews all women aged 15–49 in selected households and simply drops the more sensitive modules that would have required restricting the sample to ever-married women ([link](https://mics.unicef.org/faq)). Thus, it does not use an adjustment factor similar to AWFACTT in DHS. The MICS sampling weight (`wmweight`) is already an all-women weight.
+
+So we use plain `svymean()` and `svyby(..., FUN = svymean)` instead of
+`svyratio()`. No conceptual difference; just no correction factor to carry.
+
+```{r nga-design}
+wm$wgt <- wm$wmweight
+
+wm_design <- svydesign(
+  id      = ~HH2,
+  strata  = ~stratum,
+  weights = ~wgt,
+  data    = wm,
+  nest    = TRUE
+)
+
+design_20_24 <- subset(wm_design, WB4 >= 20 & WB4 <= 24)
+design_18_49 <- subset(wm_design, WB4 >= 18 & WB4 <= 49)
+```
+
+## Running the analysis
+
+```{r nga-analysis}
+svymean(~chmarry, design = design_20_24, na.rm = TRUE)
+svyby(~chmarry, by = ~exposed, design = design_18_49,
+      FUN = svymean, na.rm = TRUE)
+svyttest(chmarry ~ exposed, design = design_18_49)
+```
+
+# What to make of the results
+
+When you run these, you'll typically get three numbers per survey:
+
+1. **Overall CM prevalence** (women 20–24) — should agree with the published
+   DHS/MICS figure to a tenth of a percentage point. If it doesn't, something
+   upstream is wrong — usually variable coding or AWFACTT handling.
+2. **CM prevalence inside vs outside the conflict zone** (women 18–49). The
+   direction of the gap is the substantive finding; the magnitude tells you
+   how big a deal conflict is in this country-year.
+3. **A p-value**. Treat with care: it's only meaningful if the sample has
+   enough clusters in each arm to produce well-behaved cluster-robust
+   standard errors. The multi-survey pipeline
+   (`analysis_child_marriage_ipums_dhs.R`) computes design effects, effective
+   sample sizes, and a minimum detectable effect for every survey — those
+   diagnostics tell you which p-values to trust.
+
+# What we deliberately don't do here
+
+- **No regression adjustment.** Conflict zones differ from non-conflict zones
+  on observables (urban/rural mix, region, wealth) that also predict child
+  marriage. The mean comparison says "places that became conflict zones
+  differ from places that didn't" — not "being in a conflict zone causes
+  child marriage." A regression-adjusted or matched comparison would be the
+  next step for causal claims.
+- **No buffer/intensity sensitivity.** The 50-km buffer and the GED event
+  threshold are modelling choices that drive the answer. Robustness across
+  25/50/100 km and across event-intensity cutoffs usually matters more than
+  any single point estimate.
+- **No multi-survey power diagnostics.** Those live in
+  `analysis_child_marriage_ipums_dhs.R`, which iterates this same logic over
+  every IPUMS-DHS extract and produces DEFF, ρ, effective n per arm, and an
+  MDE for each survey.
+
+This file is a worked example. The pipeline is the production version.

@@ -1,0 +1,286 @@
+---
+title: "Armed Conflict and Child Stunting: A Cumulative-Exposure Fixed-Effects Panel"
+author: "Rouslan Karimov"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: simplex
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 120)
+```
+
+## What this notebook does
+
+We ask whether **armed conflict raises child stunting** (the prevalence of low
+height-for-age among under-fives). The design starts from
+[Jawad et al. (2021, *PLOS Medicine*)](https://journals.plos.org/plosmedicine/article?id=10.1371/journal.pmed.1003810)
+— a country-year two-way fixed-effects panel with country-clustered standard errors,
+as in our mortality analysis (`2_analyze_mortality.Rmd`) — but deviates from it in
+three ways dictated by the nature of stunting:
+
+1. **Stunting is a stock, not a flow.** Height-for-age reflects *cumulative* insult
+   over the first ~1,000 days and both accrues and recovers slowly, so Jawad's
+   one-year lag is the wrong exposure. We replace it with a single **cumulative-window**
+   regressor: the mean conflict intensity a country's current under-five cohort lived
+   through, averaged over the survey year and the five years before it (`t … t-5`).
+   That window spans the birth-and-first-1,000-days horizon of every child aged 0–59
+   months at the survey.
+2. **The outcome is survey-only and sparse.** Stunting is observed only in survey
+   years (JME "ground-truth" points), so the panel is highly unbalanced. We build the
+   cumulative window on the **full annual conflict grid first**, then subset to
+   survey-year rows — so the sparsity of the outcome never corrupts the exposure lag.
+3. **Few real clusters, so we don't trust analytic cluster SEs alone.** Conflict
+   variation is concentrated in a handful of countries, so we report a **wild cluster
+   bootstrap** (Webb weights, restricted null) alongside the conventional
+   country-clustered standard errors.
+
+Exposure is **battle deaths per 100,000 population** from UCDP GED, pre-built in
+`1_build_master.R`. We use the master as-is.
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(fixest)
+library(broom)
+library(slider)
+library(fwildclusterboot)
+```
+
+## The data
+
+```{r load}
+master <- readRDS(here("data_derived", "pillar4_master.rds"))
+
+# Covariate set held constant across all models (same as the mortality analysis).
+setFixest_fml(..ctrls = ~ log_gdp_pc + age_dep_ratio + pct_urban + pop_density +
+                male_schooling + temperature + rainfall + earthquake + drought)
+ctrls <- c("log_gdp_pc", "age_dep_ratio", "pct_urban", "pop_density",
+           "male_schooling", "temperature", "rainfall", "earthquake", "drought")
+```
+
+### Building the cumulative-exposure window
+
+On the **full annual grid** (every country-year 1989–2024, with zero battle deaths in
+peaceful years), we compute `mean_bd_p100k`: the rolling mean of battle deaths per
+100k over the current year and the previous five (`.before = 5`, six annual values).
+`.complete = TRUE` returns `NA` when fewer than six years are available, so a survey
+only enters the analysis once its full window lies inside the 1989–2024 conflict
+series. We analyse surveys from **1996** onward, and every one of them has a complete
+window.
+
+```{r window}
+panel <- master |>
+  arrange(iso3, year) |>
+  mutate(
+    mean_bd_p100k = slide_index_dbl(battle_deaths_p100k, year, mean,
+                                    .before = 5, .complete = TRUE),
+    # "Any war-level conflict (>=1,000 deaths) during the window" — for the
+    # presence-vs-intensity robustness check further down.
+    war_in_window = slide_index_dbl(as.integer(battle_deaths >= 1000), year, max,
+                                    .before = 5, .complete = TRUE),
+    log_gdp_pc    = log(gdp_pc),
+    .by = iso3
+  )
+```
+
+### The estimation sample
+
+We keep survey-year rows with a complete window and complete covariates. We then drop
+**singleton fixed-effect groups** — countries (or years) left with a single
+observation. These contribute nothing to the within estimator (a lone observation is
+perfectly absorbed by its own fixed effect), and leaving them in breaks the wild
+cluster bootstrap's pre-processing. We drop them iteratively until the sample is
+stable.
+
+```{r sample}
+MakeSample <- function(data, yvar, xvars) {
+  s <- data |>
+    filter(year >= 1996,   # outcomes are analysed from 1996 on
+           !is.na(.data[[yvar]]),
+           if_all(all_of(c(xvars, ctrls)), \(x) !is.na(x)))
+  repeat {
+    n0 <- nrow(s)
+    s <- s |>
+      add_count(iso3, name = "n_iso") |> filter(n_iso >= 2) |>
+      add_count(year, name = "n_yr")  |> filter(n_yr  >= 2) |>
+      select(-n_iso, -n_yr)
+    if (nrow(s) == n0) break
+  }
+  s |> mutate(iso3 = factor(iso3), year = factor(year))
+}
+
+df <- MakeSample(panel, "stunt", "mean_bd_p100k")
+```
+
+The estimation sample is **`r nrow(df)` survey-country-years** across
+**`r n_distinct(df$iso3)` countries** and **`r min(as.integer(as.character(df$year)))`–`r max(as.integer(as.character(df$year)))`**.
+Stunting prevalence is in percentage points; `mean_bd_p100k` is average annual battle
+deaths per 100,000 over the six-year window.
+
+```{r summary-table}
+df |>
+  mutate(stunt, mean_bd_p100k, war_in_window, log_gdp_pc, pct_urban, male_schooling,
+         .keep = "none") |>
+  pivot_longer(everything(), names_to = "variable") |>
+  group_by(variable) |>
+  summarise(n = sum(!is.na(value)), mean = mean(value), sd = sd(value),
+            min = min(value), median = median(value), max = max(value)) |>
+  mutate(across(mean:max, \(x) round(x, 2)))
+```
+
+## Descriptive picture
+
+```{r fig-scatter}
+df |>
+  filter(mean_bd_p100k > 0) |>
+  ggplot(aes(mean_bd_p100k, stunt)) +
+  geom_point(alpha = 0.3, colour = "#457b9d") +
+  geom_smooth(method = "lm", colour = "#c1121f", se = TRUE) +
+  scale_x_log10(labels = scales::comma) +
+  labs(title = "Stunting vs. cumulative conflict exposure",
+       subtitle = "Conflict-affected survey-years only (log x-axis); raw, before fixed effects",
+       x = "Mean battle deaths per 100,000 over t..t-5 (log scale)",
+       y = "Stunting prevalence (%)") +
+  theme_minimal(base_size = 12)
+```
+
+The raw slope conflates conflict with everything else that makes a country poor. The
+fixed-effects model strips out fixed country differences and global year shocks, and
+identifies the effect from **within-country** movement in conflict over time.
+
+## Primary model
+
+Stunting on the cumulative-exposure window plus covariates, with country and year
+fixed effects and country-clustered standard errors. The coefficient is the change in
+stunting (percentage points) per one extra average battle death per 100k across the
+six-year window.
+
+```{r primary}
+m_stunt <- feols(stunt ~ mean_bd_p100k + ..ctrls | iso3 + year,
+                 data = df, cluster = ~iso3)
+etable(m_stunt, keep = "mean_bd_p100k", headers = "Stunting (pp)")
+```
+
+## Inference: how many real clusters, and a wild cluster bootstrap
+
+### Effective-cluster diagnostic
+
+Nominal clusters (countries) overstate how much *independent* information identifies
+the conflict coefficient, because most countries are peaceful and contribute no
+within-country conflict variation. We report: the number of countries; how many are
+ever conflict-exposed in-sample; how many carry any within-country variation in the
+window exposure (only these identify the coefficient); and a Herfindahl **effective
+number of clusters** based on each country's share of the within-country
+sum-of-squares of the exposure.
+
+```{r cluster-diagnostic}
+cl <- df |>
+  group_by(iso3) |>
+  summarise(within_ss = sum((mean_bd_p100k - mean(mean_bd_p100k))^2),
+            ever_exposed = any(mean_bd_p100k > 0), .groups = "drop")
+
+tibble(
+  quantity = c("Countries (nominal clusters)",
+               "Ever conflict-exposed in sample",
+               "With within-country exposure variation (identifying)",
+               "Effective number of clusters (Herfindahl)"),
+  value = c(nrow(cl),
+            sum(cl$ever_exposed),
+            sum(cl$within_ss > 1e-12),
+            round(sum(cl$within_ss)^2 / sum(cl$within_ss^2), 1))
+)
+```
+
+If the effective count is small relative to the nominal one, analytic
+cluster-robust *t*-statistics can over-reject — which is exactly why we bootstrap.
+
+### Wild cluster bootstrap
+
+Webb 6-point weights, restricted null, 9,999 replications, clustered by country, with
+the year fixed effect held fixed in the resampling (`fe = "year"`). We report the
+bootstrap *p*-value and confidence interval **alongside** the analytic ones.
+
+```{r boottest}
+set.seed(1); dqrng::dqset.seed(1)
+bt_stunt <- boottest(m_stunt, param = "mean_bd_p100k", clustid = ~iso3,
+                     fe = "year", B = 9999, type = "webb")
+
+analytic <- coeftable(m_stunt)["mean_bd_p100k", ]
+tibble(
+  method    = c("Analytic (country-clustered)", "Wild cluster bootstrap (Webb)"),
+  estimate  = round(c(analytic["Estimate"], bt_stunt$point_estimate), 4),
+  p_value   = round(c(analytic["Pr(>|t|)"], bt_stunt$p_val), 4),
+  ci_low    = round(c(confint(m_stunt)["mean_bd_p100k", 1], bt_stunt$conf_int[1]), 4),
+  ci_high   = round(c(confint(m_stunt)["mean_bd_p100k", 2], bt_stunt$conf_int[2]), 4)
+)
+```
+
+## Robustness
+
+### Outcome scale: logit-transformed prevalence
+
+Stunting sits in the middle of its range, so the linear model is a safe
+approximation, but we confirm the conclusion survives a bounded (log-odds) scale.
+
+```{r robust-logit}
+df_logit <- df |> mutate(stunt_logit = qlogis(stunt / 100))
+m_logit  <- feols(stunt_logit ~ mean_bd_p100k + ..ctrls | iso3 + year,
+                  data = df_logit, cluster = ~iso3)
+set.seed(1); dqrng::dqset.seed(1)
+bt_logit <- boottest(m_logit, param = "mean_bd_p100k", clustid = ~iso3,
+                     fe = "year", B = 9999, type = "webb")
+etable(m_logit, keep = "mean_bd_p100k", headers = "Stunting (logit)")
+cat(sprintf("Wild cluster bootstrap: p = %.4f, 95%% CI = [%.4f, %.4f]\n",
+            bt_logit$p_val, bt_logit$conf_int[1], bt_logit$conf_int[2]))
+```
+
+### Exposure: presence vs. intensity
+
+Does the *presence* of war-level conflict (≥1,000 deaths in any window year) matter,
+as opposed to the *intensity* captured by the continuous measure?
+
+```{r robust-binary}
+df_bin  <- MakeSample(panel, "stunt", "war_in_window")
+m_bin   <- feols(stunt ~ war_in_window + ..ctrls | iso3 + year,
+                 data = df_bin, cluster = ~iso3)
+set.seed(1); dqrng::dqset.seed(1)
+bt_bin  <- boottest(m_bin, param = "war_in_window", clustid = ~iso3,
+                    fe = "year", B = 9999, type = "webb")
+etable(m_bin, keep = "war_in_window", headers = "War in window (binary)")
+cat(sprintf("Wild cluster bootstrap: p = %.4f, 95%% CI = [%.4f, %.4f]\n",
+            bt_bin$p_val, bt_bin$conf_int[1], bt_bin$conf_int[2]))
+```
+
+## Interpretation and caveats
+
+- **What we find.** Net of fixed country and year differences, the cumulative-conflict
+  coefficient on stunting is small and **not statistically distinguishable from zero**,
+  and the wild cluster bootstrap — the honest inference given how few countries carry
+  identifying conflict variation — only widens the interval. The logit and
+  presence-vs-intensity checks tell the same story. We therefore do **not** find robust
+  ecological evidence that armed conflict raises the *stock* of child stunting within
+  countries over this period.
+- **Why a null is plausible here.** Stunting is slow-moving and its secular decline is
+  strong; country fixed effects absorb the persistently-high stunting of conflict-prone
+  states, and year fixed effects absorb the global downward trend — leaving little
+  within-country, off-trend variation for a noisy, survey-only outcome to reveal. This
+  is an **ecological, country-level** design: it speaks to national averages, not to
+  the experience of individual conflict-exposed children (who are known from
+  micro-studies to suffer real height deficits).
+- **Few clusters.** The effective number of identifying clusters is far below the
+  nominal country count, so power is genuinely limited; the bootstrap makes that
+  honesty explicit rather than papering over it with tight analytic intervals.
+- **Data caveats carried from the master build.** `pop_density` is mean persons/km²
+  (not Jawad's ">1,000/km² share"); `battle_deaths_p100k` starts in 1989 (the first
+  year of UCDP GED coverage), so every survey from 1996 on carries a complete six-year
+  exposure window. Competing survey values per
+  country-year were resolved on methodology upstream in `1_build_master.R`.
+- **Companion.** Wasting — the *acute* (flow) form of malnutrition — is analysed with
+  short lags in `5_analyze_wasting.Rmd`.
+```

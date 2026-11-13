@@ -1,0 +1,308 @@
+---
+title: "Armed Conflict and Child Mortality: A Fixed-Effects Panel Analysis"
+author: "Rouslan Karimov"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: simplex
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 120)
+```
+
+## What this notebook does
+
+We ask whether **armed conflict raises child mortality**, and if so, **how long the elevation lasts** after the fighting. The design follows [Jawad et al. (2021, *PLOS Medicine*)](https://journals.plos.org/plosmedicine/article?id=10.1371/journal.pmed.1003810): a country-year panel with two-way fixed effects (country + year) and country-clustered standard errors, regressing mortality on a lagged conflict-exposure measure plus a fixed set of covariates.
+
+Two-way fixed-effects design:
+
+- **Country fixed effects** absorb everything time-invariant about a country (e.g, geography, history, institutions), so we compare each country to itself.
+- **Year fixed effects** absorb global shocks common to all countries in a year (e.g., pandemics, global price shocks, secular declines in mortality).
+- This leaves us with within-country deviation from the global trend — the variation we use to identify the conflict effect.
+
+Exposure is **lagged** because a conflict in year $t$ affects mortality that is measured and modelled with a delay. Lagging also guards against reverse causation. The **extended lag analysis** (0–8 years) then traces how the effect evolves in the years after conflict.
+
+The master dataset is pre-built in `1_build_master.R`; here we load it and analyse it.
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(fixest)
+library(broom)
+```
+
+## The data
+
+```{r load}
+master <- readRDS(here("data_derived", "pillar4_master.rds"))
+
+df <- master |>
+  arrange(iso3, year) |>
+  mutate(
+    log_gdp_pc        = log(gdp_pc),
+    conflict_bin      = as.numeric(conflict_bin),
+    conflict_cat      = factor(as.character(conflict_cat),
+                               levels = c("none", "minor", "war")),
+    conflict_quintile = factor(as.character(conflict_quintile),
+                               levels = c("none", paste0("Q", 1:5))),
+    # The master reaches back to 1989 (first year of UCDP GED coverage). We
+    # analyse mortality from 1996 on, but keep the earlier rows in the panel so
+    # the lagged exposure terms can draw on 1989-1995 conflict.
+    across(c(u5mr, imr, nnmr), \(x) if_else(year >= 1996, x, NA))
+  )
+
+# Covariate set held constant across all models (Jawad's main specification).
+# Stored as a fixest macro so we write it once and reuse it in every formula.
+setFixest_fml(..ctrls = ~ log_gdp_pc + age_dep_ratio + pct_urban + pop_density +
+                male_schooling + temperature + rainfall + earthquake + drought)
+```
+
+The panel covers **`r n_distinct(df$iso3)` countries** over **`r min(df$year)`–`r max(df$year)`** (`r nrow(df)` country-years). Mortality outcomes are analysed from **1996** on; the 1989–1995 rows supply lagged conflict exposure only. Conflict exposure is specified in four alternative ways:
+
+| Specification | Variable | Definition |
+|---|---|---|
+| Binary | `conflict_bin` | 1 if ≥ 25 battle-related deaths that year |
+| Categorical | `conflict_cat` | none / minor (25–999) / war (≥ 1,000) |
+| Continuous | `battle_deaths_p100k` | battle deaths per 100,000 population |
+| Quintiles | `conflict_quintile` | battle deaths per 100K people, split into quintiles |
+
+Battle deaths are summed across all three UCDP violence types (state-based, non-state, one-sided). Mortality outcomes are the UN IGME estimates of under-five (`u5mr`), infant (`imr`) and neonatal (`nnmr`) mortality, expressed as deaths per 1,000.
+
+```{r summary-table}
+df |>
+  select(u5mr, imr, nnmr, battle_deaths, battle_deaths_p100k,
+         gdp_pc, pct_urban, male_schooling) |>
+  pivot_longer(everything(), names_to = "variable") |>
+  group_by(variable) |>
+  summarise(
+    n      = sum(!is.na(value)),
+    mean   = mean(value, na.rm = TRUE),
+    sd     = sd(value, na.rm = TRUE),
+    min    = min(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    max    = max(value, na.rm = TRUE)
+  ) |>
+  mutate(across(mean:max, \(x) round(x, 1)))
+```
+
+## Descriptive picture
+
+### How much conflict is in the panel?
+
+```{r fig1-conflict-over-time}
+df |>
+  filter(conflict_cat != "none") |>
+  count(year, conflict_cat) |> 
+  ggplot(aes(year, n, fill = conflict_cat)) +
+  geom_col() +
+  scale_fill_manual(values = c(minor = "#f0a202", war = "#c1121f"),
+                    name = NULL, labels = c("Minor (25–999)", "War (≥1,000)")) +
+  labs(title = "Number of conflict-affected countries per year",
+       x = NULL, y = "Number of countries") +
+  theme_minimal(base_size = 12)
+```
+
+
+### Do conflict-affected countries have higher mortality?
+
+```{r fig2-mortality-trend}
+df |>
+  filter(year >= 1996) |>
+  mutate(status = if_else(conflict_bin == 1, "Conflict", "No conflict")) |>
+  group_by(year, status) |>
+  summarise(u5mr = mean(u5mr, na.rm = TRUE),
+            imr  = mean(imr,  na.rm = TRUE), .groups = "drop") |>
+  pivot_longer(c(u5mr, imr), names_to = "outcome", values_to = "rate") |>
+  mutate(outcome = recode(outcome, u5mr = "Under-5 mortality",
+                          imr = "Infant mortality")) |>
+  ggplot(aes(year, rate, colour = status)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~outcome) +
+  scale_colour_manual(values = c(Conflict = "#c1121f",
+                                 `No conflict` = "#457b9d"), name = NULL) +
+  labs(title = "Mean mortality by conflict status",
+       x = NULL, y = "Deaths per 1,000") +
+  theme_minimal(base_size = 12)
+```
+
+Conflict-affected countries sit persistently above the rest, but this could be because conflict-prone countries tend to be poorer and less developed in general. The fixed-effects models below will help us deal with this confounding.
+
+```{r fig3-scatter}
+df |>
+  filter(battle_deaths_p100k > 0) |>
+  ggplot(aes(battle_deaths_p100k, u5mr)) +
+  geom_point(alpha = 0.2, colour = "#457b9d") +
+  geom_smooth(method = "lm", colour = "#c1121f", se = TRUE) +
+  scale_x_log10(labels = scales::comma) +
+  labs(title = "Under-5 mortality vs. conflict intensity",
+       x = "Battle deaths per 100,000 (log scale)",
+       y = "Under-5 mortality (per 1,000)") +
+  theme_minimal(base_size = 12)
+```
+
+## Models
+
+Each model regresses a mortality outcome on the one-year-lagged conflict measure plus the covariates, with country and year fixed effects and standard errors clustered by country. The `l(x, 1)` operator takes the within-country one-year lag (the panel is declared via `panel.id`).
+
+```{r primary-models}
+m_bin <- feols(c(u5mr, imr, nnmr) ~ l(conflict_bin, 1) + ..ctrls |
+                 iso3 + year, df, panel.id = ~iso3 + year, cluster = ~iso3)
+m_cat <- feols(c(u5mr, imr, nnmr) ~ l(conflict_cat, 1) + ..ctrls |
+                 iso3 + year, df, panel.id = ~iso3 + year, cluster = ~iso3)
+m_cont <- feols(c(u5mr, imr, nnmr) ~ l(battle_deaths_p100k, 1) + ..ctrls |
+                  iso3 + year, df, panel.id = ~iso3 + year, cluster = ~iso3)
+m_quint <- feols(c(u5mr, imr, nnmr) ~ l(conflict_quintile, 1) + ..ctrls |
+                   iso3 + year, df, panel.id = ~iso3 + year, cluster = ~iso3)
+```
+
+### Under-5 mortality
+
+```{r tbl-u5mr}
+  etable(m_bin[[1]], m_cat[[1]], m_cont[[1]], m_quint[[1]],
+         keep = c("conflict", "battle"),
+         headers = c("Binary", "Categorical", "Continuous", "Quintiles"))
+```
+Based on continuous model: 100 extra battle death per 100K population in the year prior is associated with an increase of 10.4 deaths per 1000 in children under 5. Based on quintile model: this effect is driven by great increases in mortality from high-intensity (Q5) conflicts.
+
+### Infant mortality
+
+```{r tbl-imr}
+  etable(m_bin[[2]], m_cat[[2]], m_cont[[2]], m_quint[[2]],
+         keep = c("conflict", "battle"),
+         headers = c("Binary", "Categorical", "Continuous", "Quintiles"))
+```
+Based on continuous model: 100 extra battle death per 100K population in the year prior are associated with an increase of 4.5 infant deaths per 1000.
+
+### Neonatal mortality
+
+```{r tbl-nnmr}
+etable(m_bin[[3]], m_cat[[3]], m_cont[[3]], m_quint[[3]],
+       keep = c("conflict", "battle"),
+       headers = c("Binary", "Categorical", "Continuous", "Quintiles"))
+```
+No significant effects of conflict on neonatal mortality found, as Jawad et al. also found.
+
+In general, there are no statistically significant effects for the binary and the simple categorical conflict specifications. However, when we introduce the continuous and (its derivative) quantile specifications, we get significance, especially in the under-5 group. Infants are also affected, but not as much (coefficients are smaller than for under-5's, and the quantile model is not significant). This implies that the conflict exposure needs time to be felt.
+
+The continuous and quantile specifications capture conflict intensity, so we conclude that mere presence of conflict is not predictive of increased mortality; intensity matters.
+
+
+### Coefficient forest plot
+
+```{r fig4-forest}
+primary <- list(Binary = m_bin, Categorical = m_cat,
+                Continuous = m_cont, Quintiles = m_quint)
+
+primary_tidy <- imap(primary, \(mod, spec) {
+  meta <- models(mod)
+  map(seq_along(mod), \(i) {
+    tidy(mod[[i]], conf.int = TRUE) |>
+      filter(str_detect(term, "conflict|battle")) |>
+      mutate(spec = spec, outcome = meta$lhs[i])
+  }) |> list_rbind()
+}) |> list_rbind() |>
+  mutate(
+    term    = term |> str_remove("l\\(") |> str_remove(", 1\\)"),
+    outcome = recode(outcome, u5mr = "Under-5", imr = "Infant", nnmr = "Neonatal"),
+    outcome = factor(outcome, levels = c("Under-5", "Infant", "Neonatal"))
+  )
+
+ggplot(primary_tidy, aes(estimate, term, colour = outcome)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high),
+                  position = position_dodge(width = 0.5)) +
+  facet_grid(spec ~ ., scales = "free_y", space = "free_y") +
+  labs(title = "Conflict coefficients (1-year lag), 95% CI",
+       subtitle = "Change in deaths per 1,000 associated with the exposure term",
+       x = "Coefficient", y = NULL, colour = "Outcome") +
+  theme_bw(base_size = 12) +
+  theme(strip.text.y = element_text(angle = 0))
+```
+
+## How long does the effect last? Extended lag analysis
+
+Jawad's central contribution is showing that mortality stays elevated for years after conflict. We reproduce this by fitting, for each lag $k = 0…8$, a separate model with conflict entered at lag $k$ — the `sw()` (stepwise) operator fits one model per lag automatically. We do this for the **binary** and **continuous**
+exposures, for under-5 and infant mortality.
+
+```{r lag-profile}
+ctrls_str <- "log_gdp_pc + age_dep_ratio + pct_urban + pop_density + male_schooling + temperature + rainfall + earthquake + drought"
+
+lag_specs <- c(Binary = "conflict_bin", Continuous = "battle_deaths_p100k")
+
+lag_profile <- imap(lag_specs, \(v, spec_name) {
+  lags_str <- paste0("l(", v, ", ", 0:8, ")", collapse = ", ")
+  fml <- as.formula(sprintf("c(u5mr, imr) ~ sw(%s) + %s | iso3 + year",
+                            lags_str, ctrls_str))
+  fit  <- feols(fml, df, panel.id = ~iso3 + year, cluster = ~iso3)
+  meta <- models(fit)
+  map(seq_along(fit), \(i) {
+    tidy(fit[[i]], conf.int = TRUE) |>
+      filter(str_detect(term, fixed(v))) |>
+      mutate(spec = spec_name, outcome = meta$lhs[i],
+             lag  = as.integer(str_extract(term, "(?<=, )[0-9]+")))
+  }) |> list_rbind()
+}) |> list_rbind() |>
+  mutate(outcome = recode(outcome, u5mr = "Under-5 mortality",
+                          imr = "Infant mortality"))
+
+write_csv(lag_profile,
+          here("data_derived", "pillar4_mortality_lag_profile.csv"))
+```
+
+```{r fig5-lag-profile, fig.height=6}
+lag_profile |> 
+ggplot(aes(lag, estimate)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey50") +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15,
+              fill = "#c1121f") +
+  geom_line(colour = "#c1121f", linewidth = 0.8) +
+  geom_point(colour = "#c1121f") +
+  facet_wrap(vars(outcome, spec), scales = "free_y", nrow = 2) +
+  scale_x_continuous(breaks = 0:8) +
+  labs(title = "Effect of conflict on mortality by years since exposure",
+       subtitle = "Coefficient on conflict lagged k years, 95% CI",
+       x = "Years since conflict (lag)", y = "Effect on deaths per 1,000") +
+  theme_bw(base_size = 12)
+```
+The presence of conflict (binary specification) brings with it an increase in mortality that persists for at least 8 years post-conflict. Since the binary-spec effect estimates are not statistically significant (except in years 7 and 8, curiously), we ignore them and focus on the continuous-spec results, which are significant and positive in the first 2 years (then they become close to 0 and insignificant). We conclude that conflict exposure (high-intensity, as per findings earlier) casts a 2-year "shadow" of increased child mortality even when the conflict is over. This is consistent with damage to health systems, livelihoods and food security that outlasts the fighting itself.
+
+## Sensitivity: adding democracy and ethnic fractionalisation
+
+Jawad excludes the electoral-democracy and ethnic-fractionalisation indices from
+the main models because of high missingness (and, for HIEF, coverage ending in
+2013). Adding them back shrinks the sample but lets us check that the conflict
+coefficient is not an artefact of omitting them.
+
+```{r sensitivity}
+m_sens <- feols(u5mr ~ l(battle_deaths_p100k, 1) + ..ctrls + dem_idx + ethnic_frac |
+                  iso3 + year, df, panel.id = ~iso3 + year, cluster = ~iso3)
+
+etable(m_cont[[1]], m_sens,
+         keep = c("battle_deaths_p100k", "dem_idx", "ethnic_frac"),
+         headers = c("Main", "+ democracy & ethnic frac."))
+```
+
+The conflict coefficient is broadly unchanged (albeit on a smaller, HIEF-limited
+sample), so the main results are not driven by leaving these covariates out.
+
+## Interpretation and caveats
+
+- **Direction and intensity.** Net of fixed country and year differences, conflict
+  is associated with **higher** child mortality, and the association grows with
+  **intensity** (war > minor; Q5 > lower quintiles) rather than mere presence.
+- **Persistence.** The effect on under-5 mortality **persists over several years**, before dissipating around year 5.
+- **This is an ecological, country-level design.** It identifies national
+  associations, not individual causal effects.
+- **Data caveats carried from the master build:** `pop_density` is mean
+  persons/km² rather than Jawad's ">1,000/km² share"; `ethnic_frac` ends in 2013;
+  and the IGME outcomes retain genuine **crisis-year mortality spikes** (e.g. South
+  Sudan 1998, Somalia 2011), which are part of the signal, not noise.
+- **Next steps.** The same panel and machinery extend directly to the other
+  Pillar 4 outcomes (stunting, water & sanitation, schooling) by swapping the
+  left-hand-side variable.
+```

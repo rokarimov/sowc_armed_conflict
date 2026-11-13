@@ -1,0 +1,192 @@
+---
+title: "Analyzing the Urban/Rural Distribution Dynamics of Armed Conflict: Effect Decomposition"
+subtitle: "A Methodological Note"
+author: "Rouslan Karimov, UNICEF"
+date: 21 October 2026
+references:
+- id: audoly2025
+  type: report
+  author:
+  - family: Audoly
+    given: Richard
+  - family: McGee
+    given: Rory
+  - family: Ocampo
+    given: Sergio
+  - family: Paz-Pardo
+    given: Gonzalo
+  title: "A practitioner's note on the Shapley-Owen-Shorrocks decomposition"
+  publisher: Federal Reserve Bank of New York
+  collection-title: "Federal Reserve Bank of New York Staff Reports"
+  number: "1163"
+  issued:
+    year: 2025
+    month: 8
+  DOI: 10.59576/sr.1163
+output: html_notebook
+---
+
+**Disclosure: The author used AI in conceptualizing this analysis.**
+
+```{r, echo=FALSE}
+# Load libraries
+library(here)
+library(terra)
+library(wpp2024)
+library(tidyverse)
+library(sf)
+library(countrycode)
+library(ggrepel)
+library(furrr)
+library(showtext)  # For NotoSans
+font_add_google("Noto Sans")
+showtext_auto()
+
+# UNICEF color palette
+unicefcol <- c('#00AEEF', '#9ADBE8', '#0047BB', '#004C45', '#FFB500', '#FF8200', '#961A49', '#E2231A')
+
+# Load data
+load(here("data_derived", paste0("num_children_in_confl_globpop.RData")))
+```
+
+<style type="text/css">
+  body{
+  font-size: 13pt;
+  font-family: Verdana;
+}
+</style>
+
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+
+
+# Introduction
+
+```{r, fig.width=10, fig.height=5, warning=FALSE, echo=FALSE}
+# Children in conflict by urbanicity (DEGURBA years) ====
+confl_num_urb_global |>
+  mutate(cumnum = cumsum(children_confl_urb), .by = year) |>
+  ggplot(aes(x = year, y = children_confl_urb, fill = fct_rev(urbanicity))) +
+  geom_area() +
+  geom_text_repel(
+    aes(x = year,
+        y = case_when(year == 2015 ~ cumnum,
+                      .default = NA),
+        hjust = 0,
+        label = round(cumnum / 1e+6, 0),
+        family = "Noto Sans"
+    )) +
+  geom_text_repel(
+    aes(x = year,
+        y = case_when(year == 2025 ~ cumnum,
+                      .default = NA),
+        hjust = 1,
+        label = round(cumnum / 1e+6, 0),
+        family = "Noto Sans"
+    )) +
+  labs(y = "Number of children (millions)") +
+  scale_y_continuous(labels = \(x) x / 1e+6) +
+  scale_x_continuous(
+    breaks = seq(2015, 2027, 1)) +
+  scale_fill_manual("Urbanicity", values = unicefcol[c(1, 5, 7)]) +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        text = element_text(family = "Noto Sans", size = 14))
+```
+
+The chart above shows the head counts of children exposed to armed conflict in the world (children at risk), broken down by the urbanicity of their location. Exposure to armed conflict is defined as being inside a conflict zone. A conflict zone is defined as area within a 50 km radius of a conflict event that resulted in at least one death. The list of conflict events, with their location and timing, is drawn from the Uppsala Conflict Data Program (UCDP) Georeferenced Event Dataset ([GED](https://ucdp.uu.se/downloads/#ged_global)).
+
+As is clear from the chart, the number of children at risk in the cities and towns has increased from 2015 to 2025, while the number of children at risk in the rural areas has declined. A lay reader may conclude that there is now relatively more conflict in the cities and less conflict in the countryside. However, conflict flow from rural to urban areas is only one possible explanation. Others include the secular urbanization trend that the world has been experiencing for the past number of decades, and potential shifting of conflict from more rural to more urbanized countries over time. The goal of this analysis is to separate these effects from conflict's urban tilt and to quantify each effect's contribution.
+
+For simplicity's sake, we merge cities and towns into a single "urban" category and analyze the dichotomous urban/rural dynamics. As the figure above shows, both cities and towns experience a relative increase in the number of children at risk over time, so merging them does not mask any opposing trends.
+
+# Methodology
+
+## Basic Quantities
+
+For country $c$, urbanicity class $i \in \{\text{urb}, \text{rur}\}$ and year $t$, the global number of children at risk is
+
+$$A_i(t) = \sum_c A_{ci}(t)$$
+
+$A_{ci}(t)$ is the number of children in country $c$, class $i$, living inside the union of 50 km buffers around all UCDP GED events in year $t$ with at least one death, clipped to $c$'s borders. For countries without events, this is zero.
+
+## Factorization
+
+Define, for each country and year:
+
+$$m_{ci} = \frac{N_{ci}}{N_c}, \qquad r_{ci} = \frac{A_{ci}}{N_{ci}}, \qquad R_c = \frac{A_c}{N_c}, \qquad q_{ci} = \frac{r_{ci}}{R_c}$$
+
+where
+
+- $N_c$ is the total number of children in country $c$, and $N_{ci}$ is the number in class $i$
+- $m_{ci}$ is the share of country $c$'s children living in class $i$, so $m_{c,\text{urb}} + m_{c,\text{rur}} = 1$
+- $r_{ci}$ is the exposure rate of class $i$ in country $c$
+- $A_c = A_{c,\text{urb}} + A_{c,\text{rur}}$ is the country's total number of children at risk
+- $R_c$ is its overall exposure rate
+- $q_{ci}$ is conflict's within-country urban tilt, i.e. the exposure of class $i$ relative to the country average (set $q_{ci} = 1$ when $R_c = 0$)
+
+Each country-class count then factors as follows. Start from the definition of $r_{ci}$, then substitute the definitions of $m_{ci}$ and $q_{ci}$ in turn:
+
+$$A_{ci} = N_{ci}\, r_{ci} = N_c\, m_{ci}\, r_{ci} = N_c\, m_{ci}\, R_c\, q_{ci}$$
+
+Summing over countries:
+
+$$A_i = \sum_c N_c\, m_{ci}\, R_c\, q_{ci}$$
+
+The four factors are child population ($N_c$), urbanization ($m_{ci}$), the country's overall conflict exposure ($R_c$), and conflict's urban tilt within the country ($q_{ci}$).
+
+The tilts satisfy a constraint. Since $A_c = \sum_i A_{ci} = N_c \sum_i m_{ci}\, r_{ci}$, dividing by $N_c$ gives $R_c = \sum_i m_{ci} r_{ci}$, and dividing that by $R_c$ gives
+
+$$\sum_i m_{ci}\, q_{ci} = 1$$
+
+So the tilt is measured relative to the country's own urban/rural mix: urban children can only be over-exposed if rural children are under-exposed.
+
+## The Shapley-Owen-Shorrocks Decomposition
+
+$A_{ci}$ is a product of four factors, and we are looking at its change between 2015 and 2025. Expanding the change of a product leads to the formation of interaction terms that belong to no single factor. Here is a two-factor example:
+
+$$\Delta Y = X_1 Z_1 - X_0 Z_0 = \Delta X\, Z_0 + X_0\, \Delta Z + \Delta X\, \Delta Z$$
+
+where $\Delta X = X_1 - X_0$ and $\Delta Z = Z_1 - Z_0$. In the end, $\Delta X\, Z_0$ and $X_0\, \Delta Z$ are the separate effects of $X$ and $Z$ and $\Delta X\, \Delta Z$ is the interaction term.
+
+In the case of four factors, we get 11 interaction terms. Logarithms would remove them, because the log of a product is a sum, but they are undefined whenever a country has $A_{ci} = 0$ in either year. Unfortunately, zeros are common, because countries move into and out of conflict.
+
+The Shapley-Owen-Shorrocks decomposition (see, for example, @audoly2025) avoids both problems. A factor’s marginal contribution is the change in $A_i$ when that factor is switched from its 2015 value to its 2025 value. The combination of factors (product) is non-linear, therefore this change will depend on which other factors have already been switched. For this reason, contributions are averaged over all $4! = 24$ orders in which the four factors could be switched. The contributions add up exactly to the total change, and the result does not depend on the order in which factors are switched. Unlike the log approach, it uses only levels, so zeros cause no difficulty.
+
+## Formula
+
+For each class $i$, the change $\Delta A_i = A_i(2025) - A_i(2015)$ splits into four contributions. Each is computed as
+
+$$\phi_j = \sum_{T \subseteq F\setminus\{j\}} \frac{|T|!\,(3-|T|)!}{4!}\Big[A_i(T\cup\{j\}) - A_i(T)\Big]$$
+
+and together they account for the whole change:
+
+$$\phi_N + \phi_m + \phi_R + \phi_q = \Delta A_i$$
+
+where
+
+- $F = \{N, m, R, q\}$ is the set of factors, $j$ is the factor being evaluated, and $T$ is a subset of the other three (note that $T$ doesn't have to contain all remaining three factors; it can also hold two, one or none).
+- $A_i(T)$ is the count computed with the factors in $T$ at 2025 values and the rest at 2015 values. $A_i(T \cup\{j\})$ is same count, but with $j$ also set to its 2025 value.
+- $|T|$ is the number of factors in $T$. The weights $\frac{|T|!\,(3-|T|)!}{4!}$ work out to $1/4$ when $T$ is empty, $1/12$ for each $T$ with one or two factors, and $1/4$ when $T$ contains all three.
+
+Because $A_i$ is a sum over countries and Shapley contributions add across sums, we can run the decomposition separately for each country and add the results for one global number:
+
+$$\phi_j = \sum_c \phi_{j,c}$$
+
+where $\phi_{j,c}$ is factor $j$'s contribution in country $c$. This also shows which countries drive each component.
+
+## Interpretation
+
+For urban children:
+
+- $\phi_N$ is child population growth.
+- $\phi_m$ is the secular urbanization trend.
+- $\phi_R$ is change in how much conflict each country has. This includes countries entering or leaving conflict, since $R_c$ moves to or from zero.
+- $\phi_q$ is conflict shifting toward or away from urban areas within countries.
+
+Two caveats. First, counterfactuals that combine $m$ from one year with $q$ from the other don't satisfy $\sum_i m_{ci} q_{ci} = 1$, so $R_c$ loses its literal meaning there. This doesn't invalidate the decomposition, however. Second, the $q_{ci} = 1$ convention for $R_c = 0$ affects only countries moving into or out of conflict. We can check its influence by using the other year's $q_{ci}$ instead.
+
+# Citations
