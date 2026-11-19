@@ -55,6 +55,13 @@ countries <- ne_countries(scale = "medium", returnclass = "sf") |>
 # years are one year behind published WPP years, per documentation.
 data(popAge1dt)
 
+# Population estimates only go to 2023; for 2024 (the 2025 raster's target), we need
+# to incorporate projections
+data(popprojAge1dt)
+popAge1dt <- bind_rows(popAge1dt,
+                       popprojAge1dt |> filter(year == 2024) |> mutate(year = as.integer(year))) |>
+  select(any_of(names(popAge1dt)))
+
 wpp_totals <- popAge1dt |>
   filter(year %in% (years - 1), country_code < 900) |>
   summarise(wpp_tot_pop = sum(pop, na.rm = TRUE),
@@ -94,6 +101,11 @@ BaseRasterLinterp <- function(y) {
 # option in writeRaster. Across-year parallelism is not used: each year
 # already saturates threads and would otherwise compete for memory and I/O.
 ScaleToWPP <- function(base, y) {
+  # The scale-of-1 fallback below is meant for territories without WPP data; a year
+  # with no WPP totals at all would otherwise pass through unscaled without notice.
+  if (!any(wpp_totals$target_year == y)) {
+    stop("No WPP totals for target year ", y, " (WPP year ", y - 1, ")")
+  }
   grid_tot <- exact_extract(base, countries, fun = "sum", progress = FALSE)
   scale_vec <- tibble(iso3 = countries$iso3, grid_tot_pop = grid_tot) |>
     left_join(wpp_totals |> filter(target_year == y), by = "iso3") |>
