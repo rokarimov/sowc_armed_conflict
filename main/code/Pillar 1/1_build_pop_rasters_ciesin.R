@@ -24,7 +24,7 @@ years          <- 2000:2025
 snapshot_years <- c(2000, 2005, 2010, 2015, 2020)
 
 snapshot_paths <- here(
-  "data", "Earthdata", "popcounts_wpp_v11",
+  "data", "Earthdata", "popcounts_rev11",
   paste0("gpw_v4_population_count_rev11_", snapshot_years, "_30_sec.tif")
 )
 

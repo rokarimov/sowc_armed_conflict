@@ -26,9 +26,18 @@ area <- readxl::read_xlsx(here("data", "areas.xlsx"))
 
 ged <- readRDS(here("data_derived", "GED_cleaned.RDS")) |>
   filter(!is_copy) |>   # count each event once, not once per country it is assigned to
-  filter(year %in% 1996:2025) |>   # baseline year is 1996; GED_cleaned now retains pre-1996 events
   left_join(area |> select(iso3, sdgregcode), by =  "iso3") |> 
   st_drop_geometry()
+
+# What were the longest and bloodiest conflicts?
+lbc <- ged |> 
+  summarise(deaths = sum(best, na.rm = TRUE), iso3 = first(iso3), .by = c(conflict_new_id, conflict_name, year)) |>
+  summarise(nyears = n(), deaths = sum(deaths), iso3 = first(iso3), .by = c(conflict_new_id, conflict_name)) |> arrange(desc(nyears))
+
+write_csv(lbc, here("outputs", "conflicts_deaths_duration.csv"))
+
+# Restrict GED to years after Graca Machel report
+ged <- filter(ged, year %in% 1996:2025)
 
 # Per-year urbanicity (DUG L1) rasters, named by year (2015-2025)
 urb_dir   <- here("data_derived", "degurba")
